@@ -1,0 +1,11 @@
+package: garageadmin
+output: zz_generated.client.go
+generate:
+  models: true
+  client: true
+output-options:
+  skip-prune: false
+  # Several component schemas are literally named "<Operation>Response" (e.g.
+  # AddBucketAliasResponse), which collides with oapi-codegen's generated
+  # per-operation response wrappers. Suffix the wrappers to disambiguate.
+  response-type-suffix: Resp

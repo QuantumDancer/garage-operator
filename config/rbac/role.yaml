@@ -1,0 +1,38 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - garage.rottler.io
+  resources:
+  - garagebuckets
+  - garageclusters
+  - garagekeys
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - garage.rottler.io
+  resources:
+  - garagebuckets/finalizers
+  - garageclusters/finalizers
+  - garagekeys/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - garage.rottler.io
+  resources:
+  - garagebuckets/status
+  - garageclusters/status
+  - garagekeys/status
+  verbs:
+  - get
+  - patch
+  - update
