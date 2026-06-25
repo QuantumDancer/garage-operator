@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -273,7 +274,7 @@ var _ = Describe("Manager", Ordered, func() {
 			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
 		})
 
-		It("should bring up a single-node GarageCluster with the layout applied", func() {
+		It("should bring up a 3-node GarageCluster with the layout applied", func() {
 			const clusterNamespace = "garage-e2e"
 			const clusterName = "e2e"
 
@@ -285,17 +286,17 @@ var _ = Describe("Manager", Ordered, func() {
 			By("creating the cluster namespace")
 			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", clusterNamespace))
 
-			By("applying a single-node GarageCluster")
+			By("applying a 3-node, replication-factor-3 GarageCluster")
 			manifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
 kind: GarageCluster
 metadata:
   name: %s
   namespace: %s
 spec:
-  replicationFactor: 1
+  replicationFactor: 3
   nodePools:
     - name: default
-      replicas: 1
+      replicas: 3
       storage:
         data: { size: 1Gi }
         meta: { size: 1Gi }
@@ -305,7 +306,7 @@ spec:
 			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", manifestFile))
 			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
 
-			By("waiting for the GarageCluster to become Ready with a layout applied")
+			By("waiting for the GarageCluster to become Ready with a fully-connected 3-node layout")
 			getStatus := func(jsonPath string) (string, error) {
 				return utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
 					"-n", clusterNamespace, "-o", "jsonpath="+jsonPath))
@@ -323,6 +324,20 @@ spec:
 				health, err := getStatus("{.status.health.status}")
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(health).To(Equal("healthy"), "cluster health is not healthy")
+
+				By("asserting all three nodes peered and joined the layout")
+				connected, err := getStatus("{.status.health.connectedNodes}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(connected).To(Equal("3"), "all three nodes should be connected")
+
+				known, err := getStatus("{.status.health.knownNodes}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(known).To(Equal("3"), "all three nodes should be known")
+
+				layoutNodes, err := getStatus("{.status.layout.nodes[*].nodeId}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(utils.GetNonEmptyLines(strings.ReplaceAll(layoutNodes, " ", "\n"))).
+					To(HaveLen(3), "all three nodes should be in the layout")
 			}
 			Eventually(verifyClusterReady, 5*time.Minute, 5*time.Second).Should(Succeed())
 

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -35,16 +36,54 @@ import (
 	"github.com/QuantumDancer/garage-operator/internal/garageadmin"
 )
 
+// meshRecorder captures the peer lists ConnectNodes was called with, shared across the
+// per-pod fake admin clients a single reconcile creates.
+type meshRecorder struct {
+	calls int
+	peers [][]string
+}
+
 // fakeClusterAdmin stands in for the Garage Admin API so reconcile logic can run in envtest,
 // where no real Garage process exists.
 type fakeClusterAdmin struct {
-	nodeID string
+	nodeID   string
+	recorder *meshRecorder
 }
 
 func (f *fakeClusterAdmin) NodeID(context.Context) (string, error) { return f.nodeID, nil }
 
+func (f *fakeClusterAdmin) ConnectNodes(_ context.Context, peers []string) error {
+	if f.recorder != nil {
+		f.recorder.calls++
+		f.recorder.peers = append(f.recorder.peers, peers)
+	}
+	return nil
+}
+
 func (f *fakeClusterAdmin) EnsureLayout(context.Context, []garageadmin.DesiredRole) (bool, int64, error) {
 	return true, 1, nil
+}
+
+// newBasicClusterSpec returns a single-pool GarageCluster spec (no S3, default storage) with
+// the given replication factor and replica count, as the API server would present it after
+// defaulting. Shared by the single- and multi-node reconcile suites.
+func newBasicClusterSpec(replicationFactor, replicas int32) garagev1alpha1.GarageClusterSpec {
+	return garagev1alpha1.GarageClusterSpec{
+		Image:             garagev1alpha1.GarageImage{Repository: defaultImageRepository, Tag: defaultImageTag},
+		DBEngine:          "lmdb",
+		BlockSize:         1048576,
+		ReplicationFactor: replicationFactor,
+		ConsistencyMode:   "consistent",
+		CompressionLevel:  1,
+		NodePools: []garagev1alpha1.NodePool{{
+			Name:     "default",
+			Replicas: replicas,
+			Storage: garagev1alpha1.NodePoolStorage{
+				Data: garagev1alpha1.StorageSpec{Size: apiresource.MustParse("1Gi")},
+				Meta: garagev1alpha1.StorageSpec{Size: apiresource.MustParse("1Gi")},
+			},
+		}},
+	}
 }
 
 func (f *fakeClusterAdmin) Health(context.Context) (*garageadmin.GetClusterHealthResponse, error) {
@@ -68,12 +107,13 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 	ctx := context.Background()
 	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
 
+	mesh := &meshRecorder{}
 	reconcilerWithFakeAdmin := func() *GarageClusterReconciler {
 		return &GarageClusterReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			NewAdminClient: func(string, string) (clusterAdmin, error) {
-				return &fakeClusterAdmin{nodeID: "node-self"}, nil
+				return &fakeClusterAdmin{nodeID: "node-self", recorder: mesh}, nil
 			},
 		}
 	}
@@ -81,22 +121,7 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 	BeforeAll(func() {
 		resource := &garagev1alpha1.GarageCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
-			Spec: garagev1alpha1.GarageClusterSpec{
-				Image:             garagev1alpha1.GarageImage{Repository: "dxflrs/amd64_garage", Tag: "v2.0.0"},
-				DBEngine:          "lmdb",
-				BlockSize:         1048576,
-				ReplicationFactor: 1,
-				ConsistencyMode:   "consistent",
-				CompressionLevel:  1,
-				NodePools: []garagev1alpha1.NodePool{{
-					Name:     "default",
-					Replicas: 1,
-					Storage: garagev1alpha1.NodePoolStorage{
-						Data: garagev1alpha1.StorageSpec{Size: apiresource.MustParse("1Gi")},
-						Meta: garagev1alpha1.StorageSpec{Size: apiresource.MustParse("1Gi")},
-					},
-				}},
-			},
+			Spec:       newBasicClusterSpec(1, 1),
 		}
 		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 	})
@@ -171,6 +196,11 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 		Expect(cluster.Status.Layout.Version).To(Equal(int64(1)))
 		Expect(cluster.Status.Layout.Nodes).To(HaveLen(1))
 		Expect(cluster.Status.Layout.Nodes[0].NodeID).To(Equal("node-self"))
+
+		By("not attempting to peer a single-node cluster")
+		Expect(mesh.calls).To(Equal(0))
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionPeersConnected)).To(BeTrue())
+
 		Expect(cluster.Status.Health).NotTo(BeNil())
 		Expect(cluster.Status.Health.Status).To(Equal("healthy"))
 		Expect(cluster.Status.Health.PartitionsQuorum).To(Equal("256/256"))
@@ -197,5 +227,82 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 		// Sanity: the missing resource truly does not exist.
 		err = k8sClient.Get(ctx, types.NamespacedName{Name: missingName, Namespace: resourceNamespace}, &garagev1alpha1.GarageCluster{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+})
+
+// nodeIDFromBaseURL derives a deterministic, per-pod Garage node id from a pod's admin
+// baseURL ("http://<pod>.<headless>.<ns>.svc:<port>"), so a multi-replica fake cluster yields
+// three distinct nodes the way a real one would.
+func nodeIDFromBaseURL(baseURL string) string {
+	host := strings.TrimPrefix(baseURL, "http://")
+	host, _, _ = strings.Cut(host, ":")
+	pod, _, _ := strings.Cut(host, ".")
+	return "id-" + pod
+}
+
+var _ = Describe("GarageCluster multi-node mesh", Ordered, func() {
+	const (
+		resourceName      = "trio"
+		resourceNamespace = "default"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	mesh := &meshRecorder{}
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), recorder: mesh}, nil
+			},
+		}
+	}
+
+	BeforeAll(func() {
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(3, 3),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("peers the non-first nodes into a mesh before applying the 3-node layout", func() {
+		By("provisioning the workload (pods not yet ready)")
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(mesh.calls).To(Equal(0), "must not peer before pods are ready")
+
+		By("marking the StatefulSet ready (envtest has no kubelet to do it)")
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "trio-default", Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = 3
+		ss.Status.ReadyReplicas = 3
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("connecting node-0 to the two other nodes by their RPC DNS")
+		Expect(mesh.calls).To(Equal(1))
+		Expect(mesh.peers[0]).To(ConsistOf(
+			"id-trio-default-1@trio-default-1.trio-headless.default.svc:3901",
+			"id-trio-default-2@trio-default-2.trio-headless.default.svc:3901",
+		))
+
+		By("reporting a 3-node layout and Ready=True")
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionPeersConnected)).To(BeTrue())
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady)).To(BeTrue())
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(3))
 	})
 })

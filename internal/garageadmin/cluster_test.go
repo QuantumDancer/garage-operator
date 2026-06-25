@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -26,6 +27,11 @@ type fakeAdmin struct {
 	appliedVersions []int64
 	updateCalls     int
 	applyCalls      int
+
+	// connectResults, when set, is returned from ConnectClusterNodes (one entry per peer).
+	// When nil the server reports success for every requested peer.
+	connectResults []ConnectNodeResponse
+	connectBodies  []ConnectClusterNodesRequest
 }
 
 func (f *fakeAdmin) server() *httptest.Server {
@@ -47,6 +53,18 @@ func (f *fakeAdmin) server() *httptest.Server {
 				f.nodeID: {NodeId: f.nodeID, DbEngine: "lmdb", GarageVersion: "v2.0.0", RustVersion: "1.0"},
 			}
 			f.encode(w, resp)
+		case "/v2/ConnectClusterNodes":
+			var body ConnectClusterNodesRequest
+			f.decode(r, &body)
+			f.connectBodies = append(f.connectBodies, body)
+			results := f.connectResults
+			if results == nil {
+				results = make([]ConnectNodeResponse, len(body))
+				for i := range results {
+					results[i] = ConnectNodeResponse{Success: true}
+				}
+			}
+			f.encode(w, results)
 		case "/v2/GetClusterLayout":
 			f.encode(w, f.layout)
 		case "/v2/UpdateClusterLayout":
@@ -105,6 +123,42 @@ func TestNodeID(t *testing.T) {
 	}
 	if got != "abcd1234" {
 		t.Errorf("NodeID = %q, want %q", got, "abcd1234")
+	}
+}
+
+func TestConnectNodes(t *testing.T) {
+	fake := &fakeAdmin{t: t}
+	client := newTestClient(t, fake)
+
+	peers := []string{"node-2@pod-1.headless.ns.svc:3901", "node-3@pod-2.headless.ns.svc:3901"}
+	if err := client.ConnectNodes(context.Background(), peers); err != nil {
+		t.Fatalf("ConnectNodes: %v", err)
+	}
+	if len(fake.connectBodies) != 1 {
+		t.Fatalf("ConnectClusterNodes calls = %d, want 1", len(fake.connectBodies))
+	}
+	if got := fake.connectBodies[0]; len(got) != 2 || got[0] != peers[0] || got[1] != peers[1] {
+		t.Errorf("sent peers = %v, want %v", got, peers)
+	}
+}
+
+func TestConnectNodesSurfacesPerPeerFailure(t *testing.T) {
+	failure := "connection refused"
+	fake := &fakeAdmin{
+		t: t,
+		connectResults: []ConnectNodeResponse{
+			{Success: true},
+			{Success: false, Error: &failure},
+		},
+	}
+	client := newTestClient(t, fake)
+
+	err := client.ConnectNodes(context.Background(), []string{"ok@a:3901", "bad@b:3901"})
+	if err == nil {
+		t.Fatal("ConnectNodes error = nil, want a per-peer failure")
+	}
+	if !strings.Contains(err.Error(), "bad@b:3901") || !strings.Contains(err.Error(), failure) {
+		t.Errorf("error = %q, want it to name the failed peer and its message", err)
 	}
 }
 

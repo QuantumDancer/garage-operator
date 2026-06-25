@@ -3,6 +3,7 @@ package garageadmin
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // DesiredRole is the layout role the operator wants assigned to a single Garage node.
@@ -38,6 +39,43 @@ func (c *AdminClient) NodeID(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("GetNodeInfo: node %s reported error: %s", id, msg)
 	}
 	return "", fmt.Errorf("GetNodeInfo: empty response")
+}
+
+// ConnectNodes asks the node at this client's endpoint to open RPC connections to peers.
+// Each peer is a Garage connect string, "<nodeID>@<host>:<rpcPort>". The call is idempotent:
+// peers that are already connected report success. Garage gossip then propagates membership
+// to the rest of the mesh, so connecting one node to all others is sufficient to form it.
+func (c *AdminClient) ConnectNodes(ctx context.Context, peers []string) error {
+	resp, err := c.ConnectClusterNodesWithResponse(ctx, peers)
+	if err != nil {
+		return err
+	}
+	if resp.JSON200 == nil {
+		return fmt.Errorf("ConnectClusterNodes: unexpected status %s", resp.Status())
+	}
+
+	// Garage returns 200 even when an individual peer could not be reached, reporting the
+	// failure per-peer. Surface those as an error so the caller retries instead of treating
+	// an unformed mesh as success.
+	var failures []string
+	for i, node := range *resp.JSON200 {
+		if node.Success {
+			continue
+		}
+		msg := "unknown error"
+		if node.Error != nil {
+			msg = *node.Error
+		}
+		peer := "?"
+		if i < len(peers) {
+			peer = peers[i]
+		}
+		failures = append(failures, fmt.Sprintf("%s: %s", peer, msg))
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("ConnectClusterNodes: %s", strings.Join(failures, "; "))
+	}
+	return nil
 }
 
 // Health returns the current cluster health (mirror of Garage's GetClusterHealth).
