@@ -90,6 +90,10 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
 
+		By("cleaning up the cluster-scoped metrics ClusterRoleBinding")
+		cmd = exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
 		_, _ = utils.Run(cmd)
@@ -182,18 +186,26 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 			Eventually(verifyControllerUp).Should(Succeed())
 		})
 
-		It("should ensure the metrics endpoint is serving metrics", func() {
+		// FlakeAttempts(2) is insurance against residual warm-up jitter on a fresh Kind cluster
+		// (the metrics probe itself hits the Service ClusterIP, so it does not depend on in-pod
+		// DNS). The spec is idempotent across retries: the ClusterRoleBinding and curl pod are
+		// both create-or-replace.
+		It("should ensure the metrics endpoint is serving metrics", FlakeAttempts(2), func() {
 			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
 			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
 				"--clusterrole=garage-operator-metrics-reader",
 				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
 			)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+			// Idempotent: the binding is cluster-scoped (not torn down with the namespace), so a
+			// FlakeAttempts retry — or a rerun against a cluster a prior failed run left behind —
+			// must tolerate it already existing rather than failing before the real checks.
+			if _, err := utils.Run(cmd); err != nil {
+				Expect(err.Error()).To(ContainSubstring("already exists"), "Failed to create ClusterRoleBinding")
+			}
 
 			By("validating that the metrics service is available")
 			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
-			_, err = utils.Run(cmd)
+			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
 
 			By("getting the service account token")
@@ -223,10 +235,31 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 
 			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
 
-			// The pod is --restart=Never, so its single run must outlast cluster-DNS warm-up on
-			// a freshly-created Kind cluster (which can take a couple of minutes to resolve the
-			// metrics Service); retry for ~3 minutes, comfortably inside the 5-minute wait below.
+			By("waiting for the metrics service to have ready endpoints")
+			verifyMetricsEndpoints := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "endpoints", metricsServiceName, "-n", namespace,
+					"-o", "jsonpath={.subsets[*].addresses[*].ip}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).NotTo(BeEmpty(), "metrics service has no ready endpoints yet")
+			}
+			Eventually(verifyMetricsEndpoints, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			// Probe the metrics Service by its ClusterIP, not its DNS name. curlimages/curl is
+			// Alpine/musl, whose resolver fails to resolve *.svc.cluster.local in some Kind
+			// environments even after CoreDNS is healthy (the operator's own glibc pods resolve
+			// fine in the same cluster). The ClusterIP is routed by kube-proxy with no in-pod DNS,
+			// and TLS verification is already skipped (-k), so the cert not covering the IP is fine.
+			By("resolving the metrics service ClusterIP")
+			metricsClusterIP, err := utils.Run(exec.Command("kubectl", "get", "service", metricsServiceName,
+				"-n", namespace, "-o", "jsonpath={.spec.clusterIP}"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(metricsClusterIP).NotTo(BeEmpty(), "metrics service has no ClusterIP")
+
+			// A FlakeAttempts retry re-runs the spec from the top; clear any curl pod a prior
+			// attempt left behind so the run below is not rejected as AlreadyExists.
 			By("creating the curl-metrics pod to access the metrics endpoint")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace, "--ignore-not-found"))
 			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
 				"--namespace", namespace,
 				"--image=curlimages/curl:latest",
@@ -238,7 +271,7 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 							"image": "curlimages/curl:latest",
 							"command": ["/bin/sh", "-c"],
 							"args": [
-								"for i in $(seq 1 60); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 3; done; exit 1"
+								"for i in $(seq 1 60); do curl -v -k -H 'Authorization: Bearer %s' https://%s:8443/metrics && exit 0 || sleep 3; done; exit 1"
 							],
 							"securityContext": {
 								"readOnlyRootFilesystem": true,
@@ -255,7 +288,7 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 						}],
 						"serviceAccountName": "%s"
 					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
+				}`, token, metricsClusterIP, serviceAccountName))
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
 
