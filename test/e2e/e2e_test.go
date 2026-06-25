@@ -51,7 +51,10 @@ const metricsRoleBindingName = "garage-operator-metrics-binding"
 // into Kind so the test does not depend on a live pull at pod-start time.
 const garageImage = "dxflrs/amd64_garage:v2.0.0"
 
-var _ = Describe("Manager", Ordered, func() {
+// ContinueOnFailure keeps an unrelated spec failure (e.g. the metrics curl pod flaking on
+// cluster-DNS warm-up) from skipping the rest of this Ordered container — the GarageCluster
+// spec must run and report on its own merits regardless of the metrics spec's outcome.
+var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 	var controllerPodName string
 
 	// Before running the tests, set up the environment by creating the namespace,
@@ -220,6 +223,9 @@ var _ = Describe("Manager", Ordered, func() {
 
 			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
 
+			// The pod is --restart=Never, so its single run must outlast cluster-DNS warm-up on
+			// a freshly-created Kind cluster (which can take a couple of minutes to resolve the
+			// metrics Service); retry for ~3 minutes, comfortably inside the 5-minute wait below.
 			By("creating the curl-metrics pod to access the metrics endpoint")
 			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
 				"--namespace", namespace,
@@ -232,7 +238,7 @@ var _ = Describe("Manager", Ordered, func() {
 							"image": "curlimages/curl:latest",
 							"command": ["/bin/sh", "-c"],
 							"args": [
-								"for i in $(seq 1 30); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
+								"for i in $(seq 1 60); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 3; done; exit 1"
 							],
 							"securityContext": {
 								"readOnlyRootFilesystem": true,
