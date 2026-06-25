@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -44,6 +45,10 @@ const metricsServiceName = "garage-operator-controller-manager-metrics-service"
 
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "garage-operator-metrics-binding"
+
+// garageImage is the Garage container image the single-node e2e cluster runs. It is preloaded
+// into Kind so the test does not depend on a live pull at pod-start time.
+const garageImage = "dxflrs/amd64_garage:v2.0.0"
 
 var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
@@ -266,6 +271,64 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
 			}
 			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
+		})
+
+		It("should bring up a single-node GarageCluster with the layout applied", func() {
+			const clusterNamespace = "garage-e2e"
+			const clusterName = "e2e"
+
+			By("preloading the Garage image into the Kind cluster")
+			_, err := utils.Run(exec.Command("docker", "pull", garageImage))
+			Expect(err).NotTo(HaveOccurred(), "Failed to pull the Garage image")
+			Expect(utils.LoadImageToKindClusterWithName(garageImage)).To(Succeed(), "Failed to load Garage image into Kind")
+
+			By("creating the cluster namespace")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", clusterNamespace))
+
+			By("applying a single-node GarageCluster")
+			manifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicationFactor: 1
+  nodePools:
+    - name: default
+      replicas: 1
+      storage:
+        data: { size: 1Gi }
+        meta: { size: 1Gi }
+`, clusterName, clusterNamespace)
+			manifestFile := filepath.Join("/tmp", "garagecluster-e2e.yaml")
+			Expect(os.WriteFile(manifestFile, []byte(manifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", manifestFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
+
+			By("waiting for the GarageCluster to become Ready with a layout applied")
+			getStatus := func(jsonPath string) (string, error) {
+				return utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", clusterNamespace, "-o", "jsonpath="+jsonPath))
+			}
+			verifyClusterReady := func(g Gomega) {
+				ready, err := getStatus("{.status.conditions[?(@.type=='Ready')].status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "GarageCluster is not Ready")
+
+				version, err := getStatus("{.status.layout.version}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(version).NotTo(BeEmpty(), "layout version is not reported")
+				g.Expect(strconv.Atoi(version)).To(BeNumerically(">=", 1), "layout version should be applied")
+
+				health, err := getStatus("{.status.health.status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(health).To(Equal("healthy"), "cluster health is not healthy")
+			}
+			Eventually(verifyClusterReady, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("cleaning up the GarageCluster")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks

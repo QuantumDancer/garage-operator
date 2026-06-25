@@ -6,4 +6,10 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: garagecluster-sample
 spec:
-  # TODO(user): Add fields here
+  replicationFactor: 3
+  nodePools:
+    - name: default
+      replicas: 3
+      storage:
+        data: { size: 1Ti, storageClass: bulk }
+        meta: { size: 5Gi, storageClass: fast }
