@@ -25,4 +25,10 @@ const (
 	testBucketNS    = "media"
 	testBucketID    = "bucket-1"
 	testPoolName    = "default"
+	testKeyName     = "photos-rw"
+	testKeyNS       = "media"
+	testGarageKeyID = "GK-1"
+
+	// reasonClusterReady is the condition reason the test fixtures stamp on a Ready cluster.
+	reasonClusterReady = "ClusterReady"
 )

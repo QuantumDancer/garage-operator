@@ -491,6 +491,137 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", bucketNamespace))
 		})
 
+		It("should provision a GarageKey and grant it on a bucket with a local alias", func() {
+			const ns = "garage-key-e2e"
+			const clusterName = "keys"
+			const keyName = "appkey"
+			const bucketName = "appdata"
+
+			By("preloading the Garage image into the Kind cluster")
+			_, err := utils.Run(exec.Command("docker", "pull", garageImage))
+			Expect(err).NotTo(HaveOccurred(), "Failed to pull the Garage image")
+			Expect(utils.LoadImageToKindClusterWithName(garageImage)).To(Succeed(), "Failed to load Garage image into Kind")
+
+			By("creating the key-test namespace")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", ns))
+
+			By("applying a single-node GarageCluster to host the key and bucket")
+			clusterManifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicationFactor: 1
+  nodePools:
+    - name: default
+      replicas: 1
+      storage:
+        data: { size: 1Gi }
+        meta: { size: 1Gi }
+`, clusterName, ns)
+			clusterFile := filepath.Join("/tmp", "garagecluster-key-e2e.yaml")
+			Expect(os.WriteFile(clusterFile, []byte(clusterManifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", clusterFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
+
+			By("waiting for the hosting cluster to become Ready")
+			Eventually(func(g Gomega) {
+				ready, err := utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", ns, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "hosting cluster is not Ready")
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("applying a GarageKey (create mode)")
+			keyManifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageKey
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+  permissions:
+    createBucket: false
+  deletionPolicy: Delete
+`, keyName, ns, clusterName)
+			keyFile := filepath.Join("/tmp", "garagekey-e2e.yaml")
+			Expect(os.WriteFile(keyFile, []byte(keyManifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", keyFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageKey")
+
+			By("waiting for the GarageKey to become Ready with credentials published to a Secret")
+			Eventually(func(g Gomega) {
+				ready, err := utils.Run(exec.Command("kubectl", "get", "garagekey", keyName,
+					"-n", ns, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "GarageKey is not Ready (real Garage rejected the key)")
+
+				keyID, err := utils.Run(exec.Command("kubectl", "get", "garagekey", keyName,
+					"-n", ns, "-o", "jsonpath={.status.keyId}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(keyID).NotTo(BeEmpty(), "keyId should be recorded once the key exists in Garage")
+
+				// The credentials Secret defaults to <cr-name>-credentials and must carry both halves.
+				accessKey, err := utils.Run(exec.Command("kubectl", "get", "secret", keyName+"-credentials",
+					"-n", ns, "-o", "jsonpath={.data.accessKeyId}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(accessKey).NotTo(BeEmpty(), "accessKeyId not published")
+				secretKey, err := utils.Run(exec.Command("kubectl", "get", "secret", keyName+"-credentials",
+					"-n", ns, "-o", "jsonpath={.data.secretAccessKey}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(secretKey).NotTo(BeEmpty(), "secretAccessKey not published")
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("applying a GarageBucket that grants the key and gives it a local alias")
+			// Reaching Ready proves the grant (AllowBucketKey) and local alias (AddBucketAlias,
+			// local variant) were accepted by real Garage — the Phase 2 carryover the unit/envtest
+			// tiers cannot exercise.
+			bucketManifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageBucket
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+  globalAliases: [%s]
+  grants:
+    - keyRef:
+        name: %s
+      read: true
+      write: true
+  localAliases:
+    - keyRef:
+        name: %s
+      alias: mydata
+  deletionPolicy: Retain
+`, bucketName, ns, clusterName, bucketName, keyName, keyName)
+			bucketFile := filepath.Join("/tmp", "garagebucket-key-e2e.yaml")
+			Expect(os.WriteFile(bucketFile, []byte(bucketManifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", bucketFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageBucket")
+
+			By("waiting for the GarageBucket to become Ready (grant + local alias applied)")
+			Eventually(func(g Gomega) {
+				ready, err := utils.Run(exec.Command("kubectl", "get", "garagebucket", bucketName,
+					"-n", ns, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "GarageBucket is not Ready (grant/local alias rejected)")
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("deleting the GarageKey and confirming the finalizer is released")
+			_, err = utils.Run(exec.Command("kubectl", "delete", "garagekey", keyName,
+				"-n", ns, "--timeout=60s"))
+			Expect(err).NotTo(HaveOccurred(), "GarageKey deletion did not complete (finalizer stuck)")
+
+			By("cleaning up")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "garagebucket", bucketName, "-n", ns, "--timeout=60s"))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", clusterFile))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", ns))
+		})
+
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 
 		// TODO: Customize the e2e test suite with scenarios specific to your project.

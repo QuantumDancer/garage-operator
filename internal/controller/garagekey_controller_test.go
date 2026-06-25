@@ -18,70 +18,326 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"testing"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	garagev1alpha1 "github.com/QuantumDancer/garage-operator/api/v1alpha1"
+	"github.com/QuantumDancer/garage-operator/internal/garageadmin"
 )
 
-var _ = Describe("GarageKey Controller", func() {
-	Context("When reconciling a resource", func() {
-		const (
-			resourceName      = "test-resource"
-			resourceNamespace = "default"
-		)
+// fakeKeyAdmin is an in-memory stand-in for the key slice of the Admin API. It records the calls
+// the controller makes so tests can assert on convergence behaviour.
+type fakeKeyAdmin struct {
+	keys   map[string]*garageadmin.GetKeyInfoResponse // by accessKeyId
+	nextID int
 
-		ctx := context.Background()
+	createCalls int
+	importCalls int
+	updateCalls int
+	deleteCalls int
+}
 
-		typeNamespacedName := types.NamespacedName{
-			Name:      resourceName,
-			Namespace: resourceNamespace,
-		}
-		garagekey := &garagev1alpha1.GarageKey{}
+func newFakeKeyAdmin() *fakeKeyAdmin {
+	return &fakeKeyAdmin{keys: map[string]*garageadmin.GetKeyInfoResponse{}}
+}
 
-		BeforeEach(func() {
-			By("creating the custom resource for the Kind GarageKey")
-			err := k8sClient.Get(ctx, typeNamespacedName, garagekey)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &garagev1alpha1.GarageKey{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      resourceName,
-						Namespace: resourceNamespace,
-					},
-					// TODO(user): Specify other spec details if needed.
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-			}
-		})
+func (f *fakeKeyAdmin) GetKeyByID(_ context.Context, id string) (*garageadmin.GetKeyInfoResponse, bool, error) {
+	k, ok := f.keys[id]
+	return k, ok, nil
+}
 
-		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &garagev1alpha1.GarageKey{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
+func (f *fakeKeyAdmin) CreateKey(_ context.Context, body garageadmin.CreateKeyRequest) (*garageadmin.GetKeyInfoResponse, error) {
+	f.createCalls++
+	f.nextID++
+	id := fmt.Sprintf("GK%d", f.nextID)
+	name := ""
+	if body.Name != nil {
+		name = *body.Name
+	}
+	info := &garageadmin.GetKeyInfoResponse{AccessKeyId: id, Name: name}
+	f.keys[id] = info
+	// The returned copy carries the secret (only revealed at creation); the stored one does not.
+	withSecret := *info
+	withSecret.SecretAccessKey = ptr.To("secret-" + id)
+	return &withSecret, nil
+}
 
-			By("Cleanup the specific resource instance GarageKey")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &GarageKeyReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
+func (f *fakeKeyAdmin) ImportKey(_ context.Context, body garageadmin.ImportKeyRequest) (*garageadmin.GetKeyInfoResponse, error) {
+	f.importCalls++
+	info := &garageadmin.GetKeyInfoResponse{AccessKeyId: body.AccessKeyId}
+	if body.Name != nil {
+		info.Name = *body.Name
+	}
+	f.keys[body.AccessKeyId] = info
+	return info, nil
+}
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
-		})
+func (f *fakeKeyAdmin) UpdateKey(_ context.Context, id string, body garageadmin.UpdateKeyRequestBody) (*garageadmin.GetKeyInfoResponse, error) {
+	f.updateCalls++
+	info := f.keys[id]
+	if info == nil {
+		info = &garageadmin.GetKeyInfoResponse{AccessKeyId: id}
+		f.keys[id] = info
+	}
+	if body.Name != nil {
+		info.Name = *body.Name
+	}
+	info.Expiration = body.Expiration
+	return info, nil
+}
+
+func (f *fakeKeyAdmin) DeleteKey(_ context.Context, id string) error {
+	f.deleteCalls++
+	delete(f.keys, id)
+	return nil
+}
+
+func newKeyReconciler(t *testing.T, admin keyAdmin, objs ...client.Object) (*GarageKeyReconciler, client.Client) {
+	t.Helper()
+	scheme := bucketTestScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&garagev1alpha1.GarageKey{}).
+		Build()
+	return &GarageKeyReconciler{
+		Client:         c,
+		Scheme:         scheme,
+		NewAdminClient: func(string, string) (keyAdmin, error) { return admin, nil },
+	}, c
+}
+
+func reconcileKey(t *testing.T, r *GarageKeyReconciler) ctrl.Result {
+	t.Helper()
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: testKeyName, Namespace: testKeyNS},
 	})
-})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	return res
+}
+
+func getKey(t *testing.T, c client.Client) *garagev1alpha1.GarageKey {
+	t.Helper()
+	var k garagev1alpha1.GarageKey
+	if err := c.Get(context.Background(), types.NamespacedName{Name: testKeyName, Namespace: testKeyNS}, &k); err != nil {
+		t.Fatalf("get key: %v", err)
+	}
+	return &k
+}
+
+// keyCR builds a GarageKey fixture targeting the shared test cluster.
+func keyCR(finalized bool, spec garagev1alpha1.GarageKeySpec) *garagev1alpha1.GarageKey {
+	spec.ClusterRef = clusterRef()
+	objMeta := metav1.ObjectMeta{Name: testKeyName, Namespace: testKeyNS}
+	if finalized {
+		objMeta.Finalizers = []string{keyFinalizer}
+	}
+	return &garagev1alpha1.GarageKey{ObjectMeta: objMeta, Spec: spec}
+}
+
+func getCredentialsSecret(t *testing.T, c client.Client, name string) *corev1.Secret {
+	t.Helper()
+	var s corev1.Secret
+	if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: testKeyNS}, &s); err != nil {
+		t.Fatalf("get secret %q: %v", name, err)
+	}
+	return &s
+}
+
+func TestKeyReconcileAddsFinalizer(t *testing.T) {
+	admin := newFakeKeyAdmin()
+	r, c := newKeyReconciler(t, admin, keyCR(false, garagev1alpha1.GarageKeySpec{}))
+
+	reconcileKey(t, r)
+
+	if !controllerutil.ContainsFinalizer(getKey(t, c), keyFinalizer) {
+		t.Fatal("expected finalizer to be added on first reconcile")
+	}
+	if admin.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 before finalizer is established", admin.createCalls)
+	}
+}
+
+func TestKeyReconcilePendingWhenClusterNotReady(t *testing.T) {
+	notReady := &garagev1alpha1.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testClusterNS},
+		Spec:       garagev1alpha1.GarageClusterSpec{NodePools: []garagev1alpha1.NodePool{storagePool()}},
+	}
+	admin := newFakeKeyAdmin()
+	r, c := newKeyReconciler(t, admin, keyCR(true, garagev1alpha1.GarageKeySpec{}), notReady)
+
+	res := reconcileKey(t, r)
+	if res.RequeueAfter == 0 {
+		t.Error("expected a requeue while the cluster is not Ready")
+	}
+	cond := meta.FindStatusCondition(getKey(t, c).Status.Conditions, conditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonClusterNotReady {
+		t.Fatalf("Ready condition = %+v, want False/ClusterNotReady", cond)
+	}
+	if admin.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 while pending", admin.createCalls)
+	}
+}
+
+func TestKeyReconcileCreatesKeyAndPublishesSecret(t *testing.T) {
+	cluster, secret := readyCluster()
+	admin := newFakeKeyAdmin()
+	r, c := newKeyReconciler(t, admin, keyCR(true, garagev1alpha1.GarageKeySpec{}), cluster, secret)
+
+	reconcileKey(t, r)
+
+	if admin.createCalls != 1 {
+		t.Fatalf("createCalls = %d, want 1", admin.createCalls)
+	}
+	got := getKey(t, c)
+	if got.Status.KeyID == "" {
+		t.Error("status.keyId not recorded after creation")
+	}
+	wantSecret := testKeyName + "-credentials"
+	if got.Status.CredentialsSecret != wantSecret {
+		t.Errorf("status.credentialsSecret = %q, want %q", got.Status.CredentialsSecret, wantSecret)
+	}
+	if cond := meta.FindStatusCondition(got.Status.Conditions, conditionReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready condition = %+v, want True", cond)
+	}
+	if cond := meta.FindStatusCondition(got.Status.Conditions, conditionCredentialsPublished); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("CredentialsPublished condition = %+v, want True", cond)
+	}
+
+	out := getCredentialsSecret(t, c, wantSecret)
+	if string(out.Data[credAccessKeyID]) != got.Status.KeyID {
+		t.Errorf("secret accessKeyId = %q, want %q", out.Data[credAccessKeyID], got.Status.KeyID)
+	}
+	if len(out.Data[credSecretAccessKey]) == 0 {
+		t.Error("secret access key not published")
+	}
+	if owner := metav1.GetControllerOf(out); owner == nil || owner.Kind != "GarageKey" {
+		t.Errorf("credentials Secret owner = %+v, want controller GarageKey", owner)
+	}
+}
+
+func TestKeyReconcileImportsExistingCredentials(t *testing.T) {
+	cluster, secret := readyCluster()
+	importSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "existing-creds", Namespace: testKeyNS},
+		Data: map[string][]byte{
+			credAccessKeyID:     []byte("GKIMPORTED"),
+			credSecretAccessKey: []byte("imported-secret"),
+		},
+	}
+	admin := newFakeKeyAdmin()
+	key := keyCR(true, garagev1alpha1.GarageKeySpec{Import: &garagev1alpha1.KeyImport{SecretName: "existing-creds"}})
+	r, c := newKeyReconciler(t, admin, key, cluster, secret, importSecret)
+
+	reconcileKey(t, r)
+
+	if admin.importCalls != 1 || admin.createCalls != 0 {
+		t.Fatalf("import=%d create=%d, want import=1 create=0", admin.importCalls, admin.createCalls)
+	}
+	got := getKey(t, c)
+	if got.Status.KeyID != "GKIMPORTED" {
+		t.Errorf("status.keyId = %q, want GKIMPORTED", got.Status.KeyID)
+	}
+	out := getCredentialsSecret(t, c, testKeyName+"-credentials")
+	if string(out.Data[credSecretAccessKey]) != "imported-secret" {
+		t.Errorf("published secret = %q, want imported-secret", out.Data[credSecretAccessKey])
+	}
+}
+
+func TestKeyReconcileAdoptsFromExistingSecret(t *testing.T) {
+	// status.keyId was lost (e.g. a failed status write) but the credentials Secret survived and
+	// the key still exists in Garage: the controller must adopt it, never mint a duplicate.
+	cluster, secret := readyCluster()
+	const adoptedID = "GKADOPTED"
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: testKeyName + "-credentials", Namespace: testKeyNS},
+		Data: map[string][]byte{
+			credAccessKeyID:     []byte(adoptedID),
+			credSecretAccessKey: []byte("kept-secret"),
+		},
+	}
+	admin := newFakeKeyAdmin()
+	admin.keys[adoptedID] = &garageadmin.GetKeyInfoResponse{AccessKeyId: adoptedID}
+	r, c := newKeyReconciler(t, admin, keyCR(true, garagev1alpha1.GarageKeySpec{}), cluster, secret, credSecret)
+
+	reconcileKey(t, r)
+
+	if admin.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 (key adopted from the surviving Secret)", admin.createCalls)
+	}
+	if got := getKey(t, c); got.Status.KeyID != adoptedID {
+		t.Errorf("status.keyId = %q, want %q", got.Status.KeyID, adoptedID)
+	}
+}
+
+func TestKeyDeleteDeletesKey(t *testing.T) {
+	cluster, secret := readyCluster()
+	key := keyCR(true, garagev1alpha1.GarageKeySpec{DeletionPolicy: garagev1alpha1.KeyDeletionDelete})
+	key.Status = garagev1alpha1.GarageKeyStatus{KeyID: testGarageKeyID}
+	admin := newFakeKeyAdmin()
+	admin.keys[testGarageKeyID] = &garageadmin.GetKeyInfoResponse{AccessKeyId: testGarageKeyID}
+	r, c := newKeyReconciler(t, admin, key, cluster, secret)
+
+	if err := c.Delete(context.Background(), key); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	reconcileKey(t, r)
+
+	if admin.deleteCalls != 1 {
+		t.Errorf("deleteCalls = %d, want 1 under Delete", admin.deleteCalls)
+	}
+	var k garagev1alpha1.GarageKey
+	if err := c.Get(context.Background(), types.NamespacedName{Name: testKeyName, Namespace: testKeyNS}, &k); !apierrors.IsNotFound(err) {
+		t.Errorf("key still present after deletion: err=%v", err)
+	}
+}
+
+func TestKeyDeleteRetainKeepsKeyAndReleasesSecret(t *testing.T) {
+	cluster, secret := readyCluster()
+	key := keyCR(true, garagev1alpha1.GarageKeySpec{DeletionPolicy: garagev1alpha1.KeyDeletionRetain})
+	key.Status = garagev1alpha1.GarageKeyStatus{KeyID: testGarageKeyID, CredentialsSecret: testKeyName + "-credentials"}
+	admin := newFakeKeyAdmin()
+	admin.keys[testGarageKeyID] = &garageadmin.GetKeyInfoResponse{AccessKeyId: testGarageKeyID}
+
+	// The credentials Secret is owned by the key, as a live one would be.
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: testKeyName + "-credentials", Namespace: testKeyNS},
+		Data:       map[string][]byte{credAccessKeyID: []byte(testGarageKeyID), credSecretAccessKey: []byte("s")},
+	}
+	scheme := bucketTestScheme(t)
+	if err := controllerutil.SetControllerReference(key, credSecret, scheme); err != nil {
+		t.Fatalf("set owner ref: %v", err)
+	}
+	r, c := newKeyReconciler(t, admin, key, cluster, secret, credSecret)
+
+	if err := c.Delete(context.Background(), key); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	reconcileKey(t, r)
+
+	if admin.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0 under Retain", admin.deleteCalls)
+	}
+	// The Secret must survive the CR (owner ref released) so retained credentials stay usable.
+	out := getCredentialsSecret(t, c, testKeyName+"-credentials")
+	if owner := metav1.GetControllerOf(out); owner != nil {
+		t.Errorf("Secret still owned after Retain delete: %+v", owner)
+	}
+	var k garagev1alpha1.GarageKey
+	if err := c.Get(context.Background(), types.NamespacedName{Name: testKeyName, Namespace: testKeyNS}, &k); !apierrors.IsNotFound(err) {
+		t.Errorf("key CR still present after finalizer drop: err=%v", err)
+	}
+}

@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -47,11 +48,15 @@ type fakeBucketAdmin struct {
 	aliases map[string]string                             // global alias -> bucket id
 	nextID  int
 
-	createCalls  int
-	updateCalls  int
-	deleteCalls  int
-	addedAlias   []string
-	removedAlias []string
+	createCalls       int
+	updateCalls       int
+	deleteCalls       int
+	addedAlias        []string
+	removedAlias      []string
+	allowCalls        []string
+	denyCalls         []string
+	addedLocalAlias   []string
+	removedLocalAlias []string
 }
 
 func newFakeBucketAdmin() *fakeBucketAdmin {
@@ -122,6 +127,81 @@ func (f *fakeBucketAdmin) DeleteBucket(_ context.Context, id string) error {
 	return nil
 }
 
+func (f *fakeBucketAdmin) keyPerm(bucketID, accessKeyID string) *garageadmin.ApiBucketKeyPerm {
+	b := f.buckets[bucketID]
+	if b == nil {
+		return nil
+	}
+	for i := range b.Keys {
+		if b.Keys[i].AccessKeyId == accessKeyID {
+			return &b.Keys[i].Permissions
+		}
+	}
+	b.Keys = append(b.Keys, garageadmin.GetBucketInfoKey{AccessKeyId: accessKeyID})
+	return &b.Keys[len(b.Keys)-1].Permissions
+}
+
+func (f *fakeBucketAdmin) AllowBucketKey(_ context.Context, bucketID, accessKeyID string, perm garageadmin.ApiBucketKeyPerm) error {
+	f.allowCalls = append(f.allowCalls, accessKeyID)
+	cur := f.keyPerm(bucketID, accessKeyID)
+	applyPerm(cur, perm, true)
+	return nil
+}
+
+func (f *fakeBucketAdmin) DenyBucketKey(_ context.Context, bucketID, accessKeyID string, perm garageadmin.ApiBucketKeyPerm) error {
+	f.denyCalls = append(f.denyCalls, accessKeyID)
+	cur := f.keyPerm(bucketID, accessKeyID)
+	applyPerm(cur, perm, false)
+	return nil
+}
+
+// applyPerm sets the permissions named in chg (non-nil fields) to value on dst.
+func applyPerm(dst *garageadmin.ApiBucketKeyPerm, chg garageadmin.ApiBucketKeyPerm, value bool) {
+	if chg.Read != nil {
+		dst.Read = &value
+	}
+	if chg.Write != nil {
+		dst.Write = &value
+	}
+	if chg.Owner != nil {
+		dst.Owner = &value
+	}
+}
+
+func (f *fakeBucketAdmin) keyEntry(bucketID, accessKeyID string) *garageadmin.GetBucketInfoKey {
+	b := f.buckets[bucketID]
+	if b == nil {
+		return nil
+	}
+	for i := range b.Keys {
+		if b.Keys[i].AccessKeyId == accessKeyID {
+			return &b.Keys[i]
+		}
+	}
+	b.Keys = append(b.Keys, garageadmin.GetBucketInfoKey{AccessKeyId: accessKeyID})
+	return &b.Keys[len(b.Keys)-1]
+}
+
+func (f *fakeBucketAdmin) AddBucketLocalAlias(_ context.Context, bucketID, accessKeyID, alias string) error {
+	f.addedLocalAlias = append(f.addedLocalAlias, alias)
+	k := f.keyEntry(bucketID, accessKeyID)
+	k.BucketLocalAliases = append(k.BucketLocalAliases, alias)
+	return nil
+}
+
+func (f *fakeBucketAdmin) RemoveBucketLocalAlias(_ context.Context, bucketID, accessKeyID, alias string) error {
+	f.removedLocalAlias = append(f.removedLocalAlias, alias)
+	k := f.keyEntry(bucketID, accessKeyID)
+	kept := k.BucketLocalAliases[:0]
+	for _, a := range k.BucketLocalAliases {
+		if a != alias {
+			kept = append(kept, a)
+		}
+	}
+	k.BucketLocalAliases = kept
+	return nil
+}
+
 func bucketTestScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -155,7 +235,7 @@ func readyCluster() (*garagev1alpha1.GarageCluster, *corev1.Secret) {
 			Conditions: []metav1.Condition{{
 				Type:               conditionReady,
 				Status:             metav1.ConditionTrue,
-				Reason:             "ClusterReady",
+				Reason:             reasonClusterReady,
 				LastTransitionTime: metav1.Now(),
 			}},
 		},
@@ -246,7 +326,7 @@ func TestBucketReconcilePendingWhenClusterNotReady(t *testing.T) {
 	}
 
 	cond := meta.FindStatusCondition(getBucket(t, c).Status.Conditions, conditionReady)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "ClusterNotReady" {
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonClusterNotReady {
 		t.Fatalf("Ready condition = %+v, want False/ClusterNotReady", cond)
 	}
 	if admin.createCalls != 0 {
@@ -344,6 +424,103 @@ func TestBucketDeletePolicyDeletesEmptyBucket(t *testing.T) {
 	var b garagev1alpha1.GarageBucket
 	if err := c.Get(context.Background(), types.NamespacedName{Name: testBucketName, Namespace: testBucketNS}, &b); !apierrors.IsNotFound(err) {
 		t.Errorf("bucket still present after deletion: err=%v", err)
+	}
+}
+
+// readyGarageKey builds a GarageKey CR that has already published the given Garage key id, so
+// the bucket controller can resolve a keyRef pointing at it.
+func readyGarageKey(name, namespace, keyID string) *garagev1alpha1.GarageKey {
+	return &garagev1alpha1.GarageKey{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec:       garagev1alpha1.GarageKeySpec{ClusterRef: clusterRef()},
+		Status:     garagev1alpha1.GarageKeyStatus{KeyID: keyID},
+	}
+}
+
+func TestBucketReconcileAppliesGrant(t *testing.T) {
+	cluster, secret := readyCluster()
+	key := readyGarageKey(testKeyName, testBucketNS, testGarageKeyID)
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{
+		GlobalAliases: []string{testBucketName},
+		Grants: []garagev1alpha1.BucketGrant{{
+			KeyRef: garagev1alpha1.KeyReference{Name: testKeyName},
+			Read:   true,
+			Write:  true,
+		}},
+	})
+	admin := newFakeBucketAdmin()
+	r, c := newBucketReconciler(t, admin, bucket, key, cluster, secret)
+
+	reconcileBucket(t, r)
+
+	if len(admin.allowCalls) != 1 || admin.allowCalls[0] != testGarageKeyID {
+		t.Fatalf("allowCalls = %v, want [%s]", admin.allowCalls, testGarageKeyID)
+	}
+	if cond := meta.FindStatusCondition(getBucket(t, c).Status.Conditions, conditionReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready condition = %+v, want True", cond)
+	}
+}
+
+func TestBucketReconcilePendingWhenKeyNotReady(t *testing.T) {
+	cluster, secret := readyCluster()
+	// The key exists but has not published an id yet.
+	key := readyGarageKey(testKeyName, testBucketNS, "")
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{
+		GlobalAliases: []string{testBucketName},
+		Grants:        []garagev1alpha1.BucketGrant{{KeyRef: garagev1alpha1.KeyReference{Name: testKeyName}, Read: true}},
+	})
+	admin := newFakeBucketAdmin()
+	r, c := newBucketReconciler(t, admin, bucket, key, cluster, secret)
+
+	res := reconcileBucket(t, r)
+	if res.RequeueAfter == 0 {
+		t.Error("expected a requeue while the referenced key is not Ready")
+	}
+	if len(admin.allowCalls) != 0 {
+		t.Errorf("allowCalls = %v, want none while the key is pending", admin.allowCalls)
+	}
+	cond := meta.FindStatusCondition(getBucket(t, c).Status.Conditions, conditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "KeyNotReady" {
+		t.Fatalf("Ready condition = %+v, want False/KeyNotReady", cond)
+	}
+}
+
+func TestBucketReconcileAppliesLocalAlias(t *testing.T) {
+	cluster, secret := readyCluster()
+	key := readyGarageKey(testKeyName, testBucketNS, testGarageKeyID)
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{
+		GlobalAliases: []string{testBucketName},
+		LocalAliases:  []garagev1alpha1.LocalAlias{{KeyRef: garagev1alpha1.KeyReference{Name: testKeyName}, Alias: "pics"}},
+	})
+	admin := newFakeBucketAdmin()
+	r, _ := newBucketReconciler(t, admin, bucket, key, cluster, secret)
+
+	reconcileBucket(t, r)
+
+	if len(admin.addedLocalAlias) != 1 || admin.addedLocalAlias[0] != "pics" {
+		t.Fatalf("addedLocalAlias = %v, want [pics]", admin.addedLocalAlias)
+	}
+}
+
+func TestBucketReconcileRevokesUnlistedGrant(t *testing.T) {
+	cluster, secret := readyCluster()
+	admin := newFakeBucketAdmin()
+	// A bucket bound via status already carries a stale grant for a key no longer in the spec.
+	admin.buckets[testBucketID] = &garageadmin.GetBucketInfoResponse{
+		Id: testBucketID,
+		Keys: []garageadmin.GetBucketInfoKey{{
+			AccessKeyId: "GK-STALE",
+			Permissions: garageadmin.ApiBucketKeyPerm{Read: ptr.To(true), Write: ptr.To(true)},
+		}},
+	}
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{})
+	bucket.Status = garagev1alpha1.GarageBucketStatus{BucketID: testBucketID}
+	r, _ := newBucketReconciler(t, admin, bucket, cluster, secret)
+
+	reconcileBucket(t, r)
+
+	if len(admin.denyCalls) != 1 || admin.denyCalls[0] != "GK-STALE" {
+		t.Fatalf("denyCalls = %v, want [GK-STALE] (stale grant revoked)", admin.denyCalls)
 	}
 }
 

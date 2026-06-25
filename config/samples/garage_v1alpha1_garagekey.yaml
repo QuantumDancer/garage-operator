@@ -6,4 +6,10 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: garagekey-sample
 spec:
-  # TODO(user): Add fields here
+  clusterRef:
+    name: garagecluster-sample
+  permissions:
+    createBucket: false
+  output:
+    secretName: garagekey-sample-credentials
+  deletionPolicy: Delete

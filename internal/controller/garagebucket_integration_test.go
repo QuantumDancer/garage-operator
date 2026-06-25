@@ -78,7 +78,7 @@ var _ = Describe("GarageBucket integration", Ordered, func() {
 		}
 		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
 		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
-			Type: conditionReady, Status: metav1.ConditionTrue, Reason: "ClusterReady", Message: "ready",
+			Type: conditionReady, Status: metav1.ConditionTrue, Reason: reasonClusterReady, Message: "ready",
 		})
 		Expect(k8sClient.Status().Update(ctx, cluster)).To(Succeed())
 

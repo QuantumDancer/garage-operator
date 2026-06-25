@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -49,6 +50,13 @@ const bucketFinalizer = "garage.rottler.io/bucket-protection"
 // wake-up.
 const clusterPendingRequeue = 15 * time.Second
 
+// Condition reasons shared by the bucket and key controllers when a referenced cluster is not
+// usable yet.
+const (
+	reasonClusterNotFound = "ClusterNotFound"
+	reasonClusterNotReady = "ClusterNotReady"
+)
+
 // bucketAdmin is the slice of the Garage Admin API the bucket controller needs. It is an
 // interface so reconcile logic can be exercised against a fake in tests.
 type bucketAdmin interface {
@@ -59,6 +67,11 @@ type bucketAdmin interface {
 	AddBucketGlobalAlias(ctx context.Context, bucketID, alias string) error
 	RemoveBucketGlobalAlias(ctx context.Context, bucketID, alias string) error
 	DeleteBucket(ctx context.Context, id string) error
+
+	AllowBucketKey(ctx context.Context, bucketID, accessKeyID string, perm garageadmin.ApiBucketKeyPerm) error
+	DenyBucketKey(ctx context.Context, bucketID, accessKeyID string, perm garageadmin.ApiBucketKeyPerm) error
+	AddBucketLocalAlias(ctx context.Context, bucketID, accessKeyID, alias string) error
+	RemoveBucketLocalAlias(ctx context.Context, bucketID, accessKeyID, alias string) error
 }
 
 // GarageBucketReconciler reconciles a GarageBucket object
@@ -83,6 +96,7 @@ func defaultBucketAdminFactory(baseURL, token string) (bucketAdmin, error) {
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garagebuckets/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garagebuckets/finalizers,verbs=update
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garageclusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups=garage.rottler.io,resources=garagekeys,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
@@ -133,6 +147,11 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if err := r.converge(ctx, admin, &bucket, status); err != nil {
+		if errors.Is(err, errKeyNotReady) {
+			log.Info("Waiting for a referenced GarageKey to become Ready")
+			setBucketCondition(status, metav1.ConditionFalse, "KeyNotReady", err.Error())
+			return r.finish(ctx, &bucket, status, ctrl.Result{RequeueAfter: clusterPendingRequeue})
+		}
 		setBucketCondition(status, metav1.ConditionFalse, "ReconcileError", err.Error())
 		_, _ = r.finish(ctx, &bucket, status, ctrl.Result{})
 		return ctrl.Result{}, err
@@ -160,7 +179,11 @@ func (r *GarageBucketReconciler) converge(
 		return err
 	}
 
-	return admin.UpdateBucket(ctx, info.Id, buildUpdateBody(&bucket.Spec))
+	if err := admin.UpdateBucket(ctx, info.Id, buildUpdateBody(&bucket.Spec)); err != nil {
+		return err
+	}
+
+	return r.reconcileGrantsAndAliases(ctx, admin, bucket, info)
 }
 
 // ensureBucket resolves the CR to a live Garage bucket, creating it if necessary, and returns
@@ -317,9 +340,9 @@ func reconcileGlobalAliases(ctx context.Context, admin bucketAdmin, bucketID str
 
 func pendingReason(state resolveState, ref garagev1alpha1.ClusterReference) (reason, message string) {
 	if state == resolveClusterMissing {
-		return "ClusterNotFound", fmt.Sprintf("Referenced GarageCluster %q not found", ref.Name)
+		return reasonClusterNotFound, fmt.Sprintf("Referenced GarageCluster %q not found", ref.Name)
 	}
-	return "ClusterNotReady", fmt.Sprintf("Referenced GarageCluster %q is not Ready", ref.Name)
+	return reasonClusterNotReady, fmt.Sprintf("Referenced GarageCluster %q is not Ready", ref.Name)
 }
 
 func setBucketCondition(status *garagev1alpha1.GarageBucketStatus, s metav1.ConditionStatus, reason, message string) {
@@ -363,6 +386,7 @@ func (r *GarageBucketReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&garagev1alpha1.GarageBucket{}).
 		Watches(&garagev1alpha1.GarageCluster{}, handler.EnqueueRequestsFromMapFunc(r.bucketsForCluster)).
+		Watches(&garagev1alpha1.GarageKey{}, handler.EnqueueRequestsFromMapFunc(r.bucketsForKey)).
 		Named("garagebucket").
 		Complete(r)
 }
