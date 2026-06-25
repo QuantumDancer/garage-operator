@@ -352,6 +352,112 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
 		})
 
+		It("should provision a GarageBucket against a single-node cluster", func() {
+			const bucketNamespace = "garage-bucket-e2e"
+			const clusterName = "bkt"
+			const bucketName = "photos"
+
+			By("preloading the Garage image into the Kind cluster")
+			_, err := utils.Run(exec.Command("docker", "pull", garageImage))
+			Expect(err).NotTo(HaveOccurred(), "Failed to pull the Garage image")
+			Expect(utils.LoadImageToKindClusterWithName(garageImage)).To(Succeed(), "Failed to load Garage image into Kind")
+
+			By("creating the bucket-test namespace")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", bucketNamespace))
+
+			By("applying a single-node GarageCluster to host the bucket")
+			clusterManifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicationFactor: 1
+  nodePools:
+    - name: default
+      replicas: 1
+      storage:
+        data: { size: 1Gi }
+        meta: { size: 1Gi }
+`, clusterName, bucketNamespace)
+			clusterFile := filepath.Join("/tmp", "garagecluster-bkt-e2e.yaml")
+			Expect(os.WriteFile(clusterFile, []byte(clusterManifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", clusterFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
+
+			By("waiting for the hosting cluster to become Ready")
+			Eventually(func(g Gomega) {
+				ready, err := utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", bucketNamespace, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "hosting cluster is not Ready")
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("applying a GarageBucket with website, quotas, CORS and lifecycle rules")
+			// The rich spec is deliberate: it exercises the CR -> Admin API translation
+			// (CORS/lifecycle S3-shaped types, quota byte conversion) against real Garage, which
+			// the unit/envtest tiers cannot validate.
+			bucketManifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageBucket
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+  globalAliases: [%s]
+  website:
+    enabled: true
+    indexDocument: index.html
+    errorDocument: error.html
+  quotas:
+    maxSize: 1Gi
+    maxObjects: 1000
+  cors:
+    - id: allow-web
+      allowedOrigins: ["*"]
+      allowedMethods: [GET, HEAD]
+      allowedHeaders: ["*"]
+      maxAgeSeconds: 3600
+  lifecycle:
+    - id: expire-tmp
+      status: Enabled
+      filter:
+        prefix: tmp/
+      expiration:
+        days: 30
+      abortIncompleteMultipartUpload:
+        daysAfterInitiation: 7
+  deletionPolicy: Retain
+`, bucketName, bucketNamespace, clusterName, bucketName)
+			bucketFile := filepath.Join("/tmp", "garagebucket-e2e.yaml")
+			Expect(os.WriteFile(bucketFile, []byte(bucketManifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", bucketFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageBucket")
+
+			By("waiting for the GarageBucket to become Ready with a bucketId")
+			Eventually(func(g Gomega) {
+				ready, err := utils.Run(exec.Command("kubectl", "get", "garagebucket", bucketName,
+					"-n", bucketNamespace, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "GarageBucket is not Ready (real Garage rejected the bucket config)")
+
+				bucketID, err := utils.Run(exec.Command("kubectl", "get", "garagebucket", bucketName,
+					"-n", bucketNamespace, "-o", "jsonpath={.status.bucketId}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(bucketID).NotTo(BeEmpty(), "bucketId should be recorded once the bucket exists in Garage")
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("deleting the GarageBucket and confirming the finalizer is released (Retain)")
+			_, err = utils.Run(exec.Command("kubectl", "delete", "garagebucket", bucketName,
+				"-n", bucketNamespace, "--timeout=60s"))
+			Expect(err).NotTo(HaveOccurred(), "GarageBucket deletion did not complete (finalizer stuck)")
+
+			By("cleaning up the hosting cluster")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", clusterFile))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", bucketNamespace))
+		})
+
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 
 		// TODO: Customize the e2e test suite with scenarios specific to your project.

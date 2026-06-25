@@ -14,7 +14,20 @@ spec:
     singular: garagebucket
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - jsonPath: .status.bucketId
+      name: BucketId
+      type: string
+    - jsonPath: .spec.clusterRef.name
+      name: Cluster
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: GarageBucket is the Schema for the garagebuckets API
@@ -39,25 +52,268 @@ spec:
           spec:
             description: spec defines the desired state of GarageBucket
             properties:
-              foo:
-                description: foo is an example field of GarageBucket. Edit garagebucket_types.go
-                  to remove/update
+              clusterRef:
+                description: clusterRef selects the GarageCluster the bucket lives
+                  in.
+                properties:
+                  name:
+                    description: name is the referenced GarageCluster's name.
+                    type: string
+                  namespace:
+                    description: |-
+                      namespace is the referenced GarageCluster's namespace; defaults to the referencing
+                      object's own namespace when omitted.
+                    type: string
+                required:
+                - name
+                type: object
+              cors:
+                description: cors are the bucket's cross-origin resource sharing rules.
+                items:
+                  description: |-
+                    CORSRule is a single cross-origin resource sharing rule. It mirrors the S3 CORS rule
+                    Garage accepts, rendered in Kubernetes camelCase.
+                  properties:
+                    allowedHeaders:
+                      description: allowedHeaders are request headers permitted in
+                        a preflight request.
+                      items:
+                        type: string
+                      type: array
+                    allowedMethods:
+                      description: allowedMethods are the HTTP methods (e.g. GET,
+                        PUT) permitted for the origins.
+                      items:
+                        type: string
+                      minItems: 1
+                      type: array
+                    allowedOrigins:
+                      description: allowedOrigins are the origins (e.g. "*", "https://example.com")
+                        the rule applies to.
+                      items:
+                        type: string
+                      minItems: 1
+                      type: array
+                    exposeHeaders:
+                      description: exposeHeaders are response headers exposed to the
+                        browser.
+                      items:
+                        type: string
+                      type: array
+                    id:
+                      description: id optionally identifies the rule.
+                      type: string
+                    maxAgeSeconds:
+                      description: maxAgeSeconds is how long a browser may cache a
+                        preflight response.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                  required:
+                  - allowedMethods
+                  - allowedOrigins
+                  type: object
+                type: array
+              deletionPolicy:
+                default: Retain
+                description: deletionPolicy controls whether the Garage bucket is
+                  deleted with the CR.
+                enum:
+                - Retain
+                - Delete
                 type: string
+              globalAliases:
+                description: |-
+                  globalAliases are cluster-wide unique aliases for the bucket. Empty means the bucket
+                  has no global alias and is addressable only by its id.
+                items:
+                  type: string
+                type: array
+              grants:
+                description: grants grant GarageKeys permissions on the bucket. Reconciled
+                  in Phase 3 (see BucketGrant).
+                items:
+                  description: |-
+                    BucketGrant grants a GarageKey permissions on this bucket.
+
+                    NOTE: grants are reconciled in Phase 3, once the GarageKey controller exists to resolve
+                    keyRef to a Garage access key id. The field is accepted now but not yet acted on.
+                  properties:
+                    keyRef:
+                      description: keyRef is the GarageKey the permissions are granted
+                        to.
+                      properties:
+                        name:
+                          description: name is the referenced GarageKey's name.
+                          type: string
+                        namespace:
+                          description: |-
+                            namespace is the referenced GarageKey's namespace; defaults to the referencing
+                            object's own namespace when omitted.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    owner:
+                      description: owner allows the key to manage the bucket itself
+                        (aliases, website, quotas).
+                      type: boolean
+                    read:
+                      description: read allows the key to read objects from the bucket.
+                      type: boolean
+                    write:
+                      description: write allows the key to write objects to the bucket.
+                      type: boolean
+                  required:
+                  - keyRef
+                  type: object
+                type: array
+              lifecycle:
+                description: lifecycle are the bucket's object-lifecycle rules.
+                items:
+                  description: LifecycleRule is one object-lifecycle rule on the bucket.
+                  properties:
+                    abortIncompleteMultipartUpload:
+                      description: abortIncompleteMultipartUpload cleans up unfinished
+                        multipart uploads.
+                      properties:
+                        daysAfterInitiation:
+                          description: daysAfterInitiation aborts uploads this many
+                            days after they were started.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                      required:
+                      - daysAfterInitiation
+                      type: object
+                    expiration:
+                      description: expiration expires matching objects.
+                      properties:
+                        date:
+                          description: date expires objects on this RFC 3339 calendar
+                            date (e.g. "2026-01-01").
+                          type: string
+                        days:
+                          description: days expires objects this many days after creation.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                      type: object
+                    filter:
+                      description: filter narrows which objects the rule applies to;
+                        omitted means the whole bucket.
+                      properties:
+                        objectSizeGreaterThan:
+                          description: objectSizeGreaterThan matches objects strictly
+                            larger than this many bytes.
+                          format: int64
+                          minimum: 0
+                          type: integer
+                        objectSizeLessThan:
+                          description: objectSizeLessThan matches objects strictly
+                            smaller than this many bytes.
+                          format: int64
+                          minimum: 0
+                          type: integer
+                        prefix:
+                          description: prefix matches object keys beginning with this
+                            string.
+                          type: string
+                      type: object
+                    id:
+                      description: id optionally identifies the rule.
+                      type: string
+                    status:
+                      description: status enables or disables the rule.
+                      enum:
+                      - Enabled
+                      - Disabled
+                      type: string
+                  required:
+                  - status
+                  type: object
+                type: array
+              localAliases:
+                description: localAliases are per-key aliases. Reconciled in Phase
+                  3 (see LocalAlias).
+                items:
+                  description: |-
+                    LocalAlias binds a per-key alias name to a GarageKey for this bucket.
+
+                    NOTE: local aliases are reconciled in Phase 3, once the GarageKey controller exists to
+                    resolve keyRef to a Garage access key id. The field is accepted now but not yet acted on.
+                  properties:
+                    alias:
+                      description: alias is the bucket name visible to that key.
+                      type: string
+                    keyRef:
+                      description: keyRef is the GarageKey the alias is scoped to.
+                      properties:
+                        name:
+                          description: name is the referenced GarageKey's name.
+                          type: string
+                        namespace:
+                          description: |-
+                            namespace is the referenced GarageKey's namespace; defaults to the referencing
+                            object's own namespace when omitted.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                  required:
+                  - alias
+                  - keyRef
+                  type: object
+                type: array
+              quotas:
+                description: quotas caps the bucket's size and/or object count.
+                properties:
+                  maxObjects:
+                    description: maxObjects is the maximum number of objects in the
+                      bucket.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  maxSize:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: maxSize is the maximum total size of all objects
+                      in the bucket (e.g. 50Gi).
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                type: object
+              website:
+                description: website configures static website hosting.
+                properties:
+                  enabled:
+                    description: enabled turns website serving on for the bucket.
+                    type: boolean
+                  errorDocument:
+                    description: errorDocument is the object key served for 4xx responses
+                      (e.g. error.html).
+                    type: string
+                  indexDocument:
+                    description: indexDocument is the object key served at the root
+                      of the site (e.g. index.html).
+                    type: string
+                required:
+                - enabled
+                type: object
+            required:
+            - clusterRef
             type: object
           status:
             description: status defines the observed state of GarageBucket
             properties:
+              bucketId:
+                description: bucketId is the Garage bucket identifier the CR is bound
+                  to.
+                type: string
               conditions:
                 description: |-
                   conditions represent the current state of the GarageBucket resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                  Known types: Ready.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -116,6 +372,11 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observedGeneration:
+                description: observedGeneration is the generation most recently reconciled
+                  into status.
+                format: int64
+                type: integer
             type: object
         required:
         - spec

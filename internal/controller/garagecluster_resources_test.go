@@ -33,7 +33,7 @@ import (
 // present it (defaults applied), so the pure builders see no zero values.
 func newTestCluster() *garagev1alpha1.GarageCluster {
 	return &garagev1alpha1.GarageCluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "homelab", Namespace: "storage"},
+		ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testClusterNS},
 		Spec: garagev1alpha1.GarageClusterSpec{
 			Image:             garagev1alpha1.GarageImage{Repository: "dxflrs/amd64_garage", Tag: "v2.0.0"},
 			DBEngine:          "lmdb",
@@ -116,7 +116,7 @@ var _ = Describe("GarageCluster resource builders", func() {
 			Expect(svc.Name).To(Equal("homelab-headless"))
 			Expect(svc.Spec.ClusterIP).To(Equal(corev1.ClusterIPNone))
 			Expect(svc.Spec.PublishNotReadyAddresses).To(BeTrue())
-			Expect(svc.Spec.Selector).To(HaveKeyWithValue(labelCluster, "homelab"))
+			Expect(svc.Spec.Selector).To(HaveKeyWithValue(labelCluster, testClusterName))
 			Expect(svc.Spec.Selector).NotTo(HaveKey(labelPool))
 
 			ports := map[string]int32{}

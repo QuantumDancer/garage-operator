@@ -6,4 +6,30 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: garagebucket-sample
 spec:
-  # TODO(user): Add fields here
+  clusterRef:
+    name: garagecluster-sample
+  globalAliases:
+    - photos
+  website:
+    enabled: true
+    indexDocument: index.html
+    errorDocument: error.html
+  quotas:
+    maxSize: 50Gi
+    maxObjects: 100000
+  cors:
+    - id: allow-web
+      allowedOrigins: ["*"]
+      allowedMethods: [GET, HEAD]
+      allowedHeaders: ["*"]
+      maxAgeSeconds: 3600
+  lifecycle:
+    - id: expire-tmp
+      status: Enabled
+      filter:
+        prefix: tmp/
+      expiration:
+        days: 30
+      abortIncompleteMultipartUpload:
+        daysAfterInitiation: 7
+  deletionPolicy: Retain
