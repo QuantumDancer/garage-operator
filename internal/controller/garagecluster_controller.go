@@ -55,6 +55,7 @@ const workloadRequeue = 10 * time.Second
 // interface so reconcile logic can be exercised against a fake in tests.
 type clusterAdmin interface {
 	NodeID(ctx context.Context) (string, error)
+	ConnectNodes(ctx context.Context, peers []string) error
 	EnsureLayout(ctx context.Context, desired []garageadmin.DesiredRole) (applied bool, version int64, err error)
 	Health(ctx context.Context) (*garageadmin.GetClusterHealthResponse, error)
 }
@@ -134,7 +135,19 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		setCondition(status, conditionReady, metav1.ConditionFalse, "NodesNotReachable", "Garage nodes are not reachable yet")
 		return r.finish(ctx, &cluster, status, ctrl.Result{RequeueAfter: workloadRequeue})
 	}
-	setCondition(status, conditionPeersConnected, metav1.ConditionTrue, "NodesReachable", "All Garage nodes are reachable")
+	// Form the RPC mesh before applying layout: UpdateClusterLayout can only assign roles to
+	// node ids the serving node has connected to, so an unmeshed cluster cannot be laid out.
+	if peers := peerConnectStrings(&cluster, desired); len(peers) > 0 {
+		if err := layoutClient.ConnectNodes(ctx, peers); err != nil {
+			log.Info("Waiting for Garage nodes to peer", "reason", err.Error())
+			setCondition(status, conditionPeersConnected, metav1.ConditionFalse, "ConnectFailed", "Waiting for Garage nodes to peer")
+			setCondition(status, conditionReady, metav1.ConditionFalse, "ConnectFailed", "Garage nodes are not peered yet")
+			return r.finish(ctx, &cluster, status, ctrl.Result{RequeueAfter: workloadRequeue})
+		}
+		setCondition(status, conditionPeersConnected, metav1.ConditionTrue, "NodesConnected", "Garage nodes are connected into a mesh")
+	} else {
+		setCondition(status, conditionPeersConnected, metav1.ConditionTrue, "SingleNode", "Single-node cluster needs no peering")
+	}
 
 	_, version, err := layoutClient.EnsureLayout(ctx, desiredRoles(desired))
 	if err != nil {
@@ -373,6 +386,22 @@ func (r *GarageClusterReconciler) finish(ctx context.Context, cluster *garagev1a
 		return ctrl.Result{}, err
 	}
 	return result, nil
+}
+
+// peerConnectStrings builds the Garage connect strings ("<nodeID>@<host>:<rpcPort>") the
+// operator hands to ConnectNodes. The first node backs the layout client and is the one we
+// connect *from*, so it is excluded — connecting it to every other node is enough for gossip
+// to propagate full membership. Returns nil for a single-node cluster (nothing to peer).
+func peerConnectStrings(cluster *garagev1alpha1.GarageCluster, nodes []nodeEndpoint) []string {
+	if len(nodes) < 2 {
+		return nil
+	}
+	peers := make([]string, 0, len(nodes)-1)
+	for _, n := range nodes[1:] {
+		host := fmt.Sprintf("%s.%s.%s.svc", n.pod, headlessServiceName(cluster), cluster.Namespace)
+		peers = append(peers, fmt.Sprintf("%s@%s:%d", n.nodeID, host, portRPC))
+	}
+	return peers
 }
 
 func desiredRoles(nodes []nodeEndpoint) []garageadmin.DesiredRole {
