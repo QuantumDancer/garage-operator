@@ -51,6 +51,12 @@ const (
 // converges. Garage convergence emits no Kubernetes events, so these steps poll.
 const workloadRequeue = 10 * time.Second
 
+// steadyStateRequeue re-reconciles a healthy, converged cluster periodically. Garage-internal
+// state (partition quorum, node connectivity) changes without any Kubernetes event and is not
+// covered by the Owns() watches, so without a steady-state requeue status.health would go
+// stale until an unrelated change happened to trigger a reconcile.
+const steadyStateRequeue = time.Minute
+
 // clusterAdmin is the slice of the Garage Admin API the cluster controller needs. It is an
 // interface so reconcile logic can be exercised against a fake in tests.
 type clusterAdmin interface {
@@ -162,7 +168,7 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	setCondition(status, conditionReady, metav1.ConditionTrue, "ClusterReady", "Garage cluster is ready")
-	return r.finish(ctx, &cluster, status, ctrl.Result{})
+	return r.finish(ctx, &cluster, status, ctrl.Result{RequeueAfter: steadyStateRequeue})
 }
 
 // ensureWorkload converges every in-cluster child resource. Each concern is independent so a

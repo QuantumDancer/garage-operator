@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"strings"
@@ -70,6 +72,18 @@ const (
 
 // secretKeyToken is the key under which generated admin-token / RPC secrets are stored.
 const secretKeyToken = "token"
+
+// annotationConfigHash stamps each pod template with a digest of the rendered garage.toml.
+// Garage reads its config only at startup and the operator mounts it from a ConfigMap, so a
+// ConfigMap edit alone would never restart the pods. Rolling the digest into the pod template
+// makes a config change a template change, which StatefulSet then propagates as a rolling
+// restart. The digest is deterministic, so an unchanged config never forces a spurious roll.
+const annotationConfigHash = "garage.rottler.io/config-hash"
+
+func configHash(toml string) string {
+	sum := sha256.Sum256([]byte(toml))
+	return hex.EncodeToString(sum[:])
+}
 
 // Default Garage image, applied by the operator when spec.image is omitted. CRD field
 // defaults do not descend into an omitted parent object, so the controller defaults here to
@@ -300,6 +314,7 @@ func desiredStatefulSet(c *garagev1alpha1.GarageCluster, pool *garagev1alpha1.No
 	admin := resolveAdminTokenSecret(c)
 	rpc := resolveRpcSecret(c)
 	image := garageImage(c)
+	podAnnotations := map[string]string{annotationConfigHash: configHash(renderGarageToml(c))}
 
 	container := corev1.Container{
 		Name:            "garage",
@@ -348,7 +363,7 @@ func desiredStatefulSet(c *garagev1alpha1.GarageCluster, pool *garagev1alpha1.No
 			PodManagementPolicy: appsv1.ParallelPodManagement,
 			Selector:            &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels, Annotations: podAnnotations},
 				Spec: corev1.PodSpec{
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   ptr.To(true),

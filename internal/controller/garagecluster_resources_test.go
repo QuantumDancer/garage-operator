@@ -186,6 +186,29 @@ var _ = Describe("GarageCluster resource builders", func() {
 		})
 	})
 
+	Describe("config hash annotation", func() {
+		It("stamps the pod template with a config-hash annotation", func() {
+			ss := desiredStatefulSet(cluster, &cluster.Spec.NodePools[0])
+			Expect(ss.Spec.Template.Annotations).To(HaveKey(annotationConfigHash))
+			Expect(ss.Spec.Template.Annotations[annotationConfigHash]).NotTo(BeEmpty())
+		})
+
+		It("changes the hash when rendered config changes, forcing a rolling restart", func() {
+			before := desiredStatefulSet(cluster, &cluster.Spec.NodePools[0]).Spec.Template.Annotations[annotationConfigHash]
+
+			cluster.Spec.BlockSize = 2 * 1048576
+			after := desiredStatefulSet(cluster, &cluster.Spec.NodePools[0]).Spec.Template.Annotations[annotationConfigHash]
+
+			Expect(after).NotTo(Equal(before))
+		})
+
+		It("is stable when the config is unchanged, so converged clusters do not roll", func() {
+			a := desiredStatefulSet(cluster, &cluster.Spec.NodePools[0]).Spec.Template.Annotations[annotationConfigHash]
+			b := desiredStatefulSet(cluster, &cluster.Spec.NodePools[0]).Spec.Template.Annotations[annotationConfigHash]
+			Expect(a).To(Equal(b))
+		})
+	})
+
 	Describe("resolveBootstrapSecret", func() {
 		It("uses the generated Secret when mode is Generate", func() {
 			ref := resolveRpcSecret(cluster)
