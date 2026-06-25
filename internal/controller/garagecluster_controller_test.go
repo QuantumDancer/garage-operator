@@ -101,6 +101,7 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 		resourceName      = "test-resource"
 		resourceNamespace = "default"
 		rpcSecretName     = "test-resource-rpc-token"
+		defaultSSName     = "test-resource-default"
 		missingName       = "missing"
 	)
 
@@ -153,7 +154,7 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 		}
 
 		var ss appsv1.StatefulSet
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-default", Namespace: resourceNamespace}, &ss)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: defaultSSName, Namespace: resourceNamespace}, &ss)).To(Succeed())
 		Expect(*ss.Spec.Replicas).To(Equal(int32(1)))
 
 		By("reporting WorkloadReady=False while pods are not ready")
@@ -178,7 +179,7 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 	It("applies the layout and reports Ready once pods are ready", func() {
 		By("marking the StatefulSet ready (envtest has no kubelet to do it)")
 		var ss appsv1.StatefulSet
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-resource-default", Namespace: resourceNamespace}, &ss)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: defaultSSName, Namespace: resourceNamespace}, &ss)).To(Succeed())
 		ss.Status.ObservedGeneration = ss.Generation
 		ss.Status.Replicas = 1
 		ss.Status.ReadyReplicas = 1
@@ -186,7 +187,9 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 
 		result, err := reconcilerWithFakeAdmin().Reconcile(ctx, reconcile.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.RequeueAfter).To(BeZero())
+		// A converged cluster requeues periodically so status.health is re-polled even
+		// though Garage emits no Kubernetes event when its internal health changes.
+		Expect(result.RequeueAfter).To(Equal(steadyStateRequeue))
 
 		var cluster garagev1alpha1.GarageCluster
 		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
@@ -209,6 +212,28 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 	It("is idempotent: a converged reconcile does not error", func() {
 		_, err := reconcilerWithFakeAdmin().Reconcile(ctx, reconcile.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("rolls the StatefulSet pod template when the Garage config changes", func() {
+		ssName := types.NamespacedName{Name: defaultSSName, Namespace: resourceNamespace}
+		var before appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, ssName, &before)).To(Succeed())
+		hashBefore := before.Spec.Template.Annotations[annotationConfigHash]
+		Expect(hashBefore).NotTo(BeEmpty())
+
+		By("editing a rendered config field on the spec")
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Spec.CompressionLevel = 5
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		_, err := reconcilerWithFakeAdmin().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("propagating a new config hash into the StatefulSet pod template")
+		var after appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, ssName, &after)).To(Succeed())
+		Expect(after.Spec.Template.Annotations[annotationConfigHash]).NotTo(Equal(hashBefore))
 	})
 
 	It("ignores a deleted resource", func() {
