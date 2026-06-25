@@ -258,8 +258,10 @@ type GarageBucketSpec struct {
 	// +optional
 	Grants []BucketGrant `json:"grants,omitempty"`
 
-	// deletionPolicy controls whether the Garage bucket is deleted with the CR.
-	// +kubebuilder:default=Retain
+	// deletionPolicy controls whether the Garage bucket is deleted with the CR. The default
+	// is Delete (fully-managed: deleting the CR deletes the bucket); a non-empty bucket is
+	// refused until emptied. Set Retain to leave the bucket in place when the CR is deleted.
+	// +kubebuilder:default=Delete
 	// +optional
 	DeletionPolicy BucketDeletionPolicy `json:"deletionPolicy,omitempty"`
 }

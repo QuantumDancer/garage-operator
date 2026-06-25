@@ -32,4 +32,4 @@ spec:
         days: 30
       abortIncompleteMultipartUpload:
         daysAfterInitiation: 7
-  deletionPolicy: Retain
+  deletionPolicy: Delete # Delete (default): deleting the CR deletes the bucket (refused while non-empty). Retain leaves it.

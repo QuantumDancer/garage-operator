@@ -115,9 +115,11 @@ spec:
                   type: object
                 type: array
               deletionPolicy:
-                default: Retain
-                description: deletionPolicy controls whether the Garage bucket is
-                  deleted with the CR.
+                default: Delete
+                description: |-
+                  deletionPolicy controls whether the Garage bucket is deleted with the CR. The default
+                  is Delete (fully-managed: deleting the CR deletes the bucket); a non-empty bucket is
+                  refused until emptied. Set Retain to leave the bucket in place when the CR is deleted.
                 enum:
                 - Retain
                 - Delete

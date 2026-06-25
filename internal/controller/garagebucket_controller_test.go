@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -29,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -181,6 +183,7 @@ func newBucketReconciler(t *testing.T, admin bucketAdmin, objs ...client.Object)
 		Client:         c,
 		Scheme:         scheme,
 		NewAdminClient: func(string, string) (bucketAdmin, error) { return admin, nil },
+		Recorder:       record.NewFakeRecorder(100),
 	}, c
 }
 
@@ -370,5 +373,16 @@ func TestBucketDeleteRefusesNonEmptyBucket(t *testing.T) {
 	cond := meta.FindStatusCondition(got.Status.Conditions, conditionReady)
 	if cond == nil || cond.Reason != "DeletionBlocked" {
 		t.Fatalf("Ready condition = %+v, want reason DeletionBlocked", cond)
+	}
+
+	// The block must also surface as an Event so it shows up in `kubectl describe` during a
+	// hung delete, not just in the status condition.
+	select {
+	case ev := <-r.Recorder.(*record.FakeRecorder).Events:
+		if !strings.Contains(ev, "DeletionBlocked") {
+			t.Errorf("event = %q, want it to mention DeletionBlocked", ev)
+		}
+	default:
+		t.Error("expected a DeletionBlocked event to be recorded")
 	}
 }

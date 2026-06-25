@@ -22,11 +22,13 @@ import (
 	"slices"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -67,6 +69,10 @@ type GarageBucketReconciler struct {
 	// NewAdminClient builds an admin client for a cluster's endpoint. Defaulted to the real
 	// Garage Admin API client; overridden in tests.
 	NewAdminClient func(baseURL, token string) (bucketAdmin, error)
+
+	// Recorder emits Events onto the CR (e.g. why a delete is blocked) so the reason is
+	// visible in `kubectl describe`/`get events`, not just in a status condition.
+	Recorder record.EventRecorder
 }
 
 func defaultBucketAdminFactory(baseURL, token string) (bucketAdmin, error) {
@@ -78,6 +84,7 @@ func defaultBucketAdminFactory(baseURL, token string) (bucketAdmin, error) {
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garagebuckets/finalizers,verbs=update
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garageclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 // Reconcile drives a Garage bucket toward the GarageBucket spec. It resolves the referenced
 // cluster's Admin API, creates the bucket if absent, and converges global aliases, website,
@@ -259,6 +266,7 @@ func (r *GarageBucketReconciler) blockDeletion(ctx context.Context, bucket *gara
 	status := bucket.Status.DeepCopy()
 	msg := fmt.Sprintf("Refusing to delete non-empty bucket (%d objects); empty it or set deletionPolicy: Retain", objects)
 	setBucketCondition(status, metav1.ConditionFalse, "DeletionBlocked", msg)
+	r.Recorder.Event(bucket, corev1.EventTypeWarning, "DeletionBlocked", msg)
 	if _, err := r.finish(ctx, bucket, status, ctrl.Result{}); err != nil {
 		return ctrl.Result{}, err
 	}
