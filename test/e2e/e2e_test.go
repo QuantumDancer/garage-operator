@@ -630,6 +630,112 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", scFile))
 		})
 
+		It("should migrate a node's storage when its data size is shrunk", func() {
+			const clusterNamespace = "garage-shrink-e2e"
+			const clusterName = "shrink"
+			const ssName = "shrink-default"
+
+			By("preloading the Garage image into the Kind cluster")
+			_, err := utils.Run(exec.Command("docker", "pull", garageImage))
+			Expect(err).NotTo(HaveOccurred(), "Failed to pull the Garage image")
+			Expect(utils.LoadImageToKindClusterWithName(garageImage)).To(Succeed(), "Failed to load Garage image into Kind")
+
+			By("creating the shrink-test namespace")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", clusterNamespace))
+
+			// replicationFactor 2 with 3 nodes: draining one node for recreation still leaves two,
+			// which can hold both replicas, so the cluster re-replicates fully (the migration's
+			// safety gate) and stays healthy throughout. A shrink cannot be served in place — a PVC
+			// never shrinks — so the operator drains, recreates, and refills each node in turn.
+			By("applying a 3-node, replication-factor-2 GarageCluster with 2Gi data volumes")
+			manifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicationFactor: 2
+  nodePools:
+    - name: default
+      replicas: 3
+      storage:
+        data: { size: 2Gi }
+        meta: { size: 1Gi }
+`, clusterName, clusterNamespace)
+			manifestFile := filepath.Join("/tmp", "garagecluster-shrink-e2e.yaml")
+			Expect(os.WriteFile(manifestFile, []byte(manifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", manifestFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
+
+			getStatus := func(jsonPath string) (string, error) {
+				return utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", clusterNamespace, "-o", "jsonpath="+jsonPath))
+			}
+
+			By("waiting for the 3-node cluster to become Ready at 2Gi")
+			Eventually(func(g Gomega) {
+				ready, err := getStatus("{.status.conditions[?(@.type=='Ready')].status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "GarageCluster is not Ready")
+				nodes, err := getStatus("{.status.layout.nodes[*].nodeId}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(utils.GetNonEmptyLines(strings.ReplaceAll(nodes, " ", "\n"))).
+					To(HaveLen(3), "all three nodes should be in the layout")
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("shrinking the data volume from 2Gi to 1Gi")
+			_, err = utils.Run(exec.Command("kubectl", "patch", "garagecluster", clusterName,
+				"-n", clusterNamespace, "--type=json",
+				"-p", `[{"op":"replace","path":"/spec/nodePools/0/storage/data/size","value":"1Gi"}]`))
+			Expect(err).NotTo(HaveOccurred(), "Failed to patch data size")
+
+			By("observing the migration take over (Ready reports StorageMigrating)")
+			Eventually(func(g Gomega) {
+				reason, err := getStatus("{.status.conditions[?(@.type=='Ready')].reason}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(reason).To(Equal("StorageMigrating"), "the migration should take over the layout")
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("migrating every node in turn: all three data PVCs end up recreated at 1Gi")
+			Eventually(func(g Gomega) {
+				for ordinal := 0; ordinal < 3; ordinal++ {
+					pvcSize, err := utils.Run(exec.Command("kubectl", "get", "pvc",
+						fmt.Sprintf("data-%s-%d", ssName, ordinal), "-n", clusterNamespace,
+						"-o", "jsonpath={.spec.resources.requests.storage}"))
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(pvcSize).To(Equal("1Gi"), "node %d data PVC should be recreated at 1Gi", ordinal)
+				}
+			}, 12*time.Minute, 10*time.Second).Should(Succeed())
+
+			By("converging: migration cleared, layout capacity 1Gi, cluster healthy with 3 nodes")
+			Eventually(func(g Gomega) {
+				phase, err := getStatus("{.status.storageMigration.phase}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(phase).To(BeEmpty(), "the migration should be complete")
+
+				ready, err := getStatus("{.status.conditions[?(@.type=='Ready')].reason}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("ClusterReady"), "the cluster should return to a steady Ready")
+
+				capacity, err := getStatus("{.status.layout.nodes[0].capacity}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(capacity).To(Equal("1Gi"), "layout capacity should reflect the shrunk data size")
+
+				health, err := getStatus("{.status.health.status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(health).To(Equal("healthy"), "cluster should be healthy after the migration")
+
+				nodes, err := getStatus("{.status.layout.nodes[*].nodeId}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(utils.GetNonEmptyLines(strings.ReplaceAll(nodes, " ", "\n"))).
+					To(HaveLen(3), "all three nodes should be back in the layout")
+			}, 5*time.Minute, 10*time.Second).Should(Succeed())
+
+			By("cleaning up the GarageCluster")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
+		})
+
 		It("should take a metadata snapshot and launch a repair when annotated", func() {
 			const clusterNamespace = "garage-maint-e2e"
 			const clusterName = "maint"

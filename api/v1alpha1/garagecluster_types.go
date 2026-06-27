@@ -303,6 +303,12 @@ type HealthStatus struct {
 
 	// partitionsQuorum is the "<withQuorum>/<total>" partition quorum ratio.
 	PartitionsQuorum string `json:"partitionsQuorum"`
+
+	// partitionsAllOk is the "<fullyReplicated>/<total>" ratio of partitions connected to
+	// all of their responsible storage nodes. When the two numbers match, the cluster is
+	// fully re-replicated — the signal the storage migration waits for before it destroys
+	// and recreates a node's volumes.
+	PartitionsAllOk string `json:"partitionsAllOk"`
 }
 
 // EndpointsStatus reports the resolved client-facing endpoints.
@@ -368,6 +374,44 @@ type MaintenanceStatus struct {
 	Repair *RepairStatus `json:"repair,omitempty"`
 }
 
+// StorageMigrationPhase is the stage the node currently being migrated is in.
+// +kubebuilder:validation:Enum=Draining;AwaitingReplication;RecreatingVolume;AwaitingRejoin
+type StorageMigrationPhase string
+
+const (
+	// StorageMigrationDraining is removing the node from the layout so Garage redistributes
+	// its data to the remaining replicas.
+	StorageMigrationDraining StorageMigrationPhase = "Draining"
+	// StorageMigrationAwaitingReplication is waiting for the drain to fully re-replicate
+	// (every partition connected to all its responsible nodes) before destroying the volume.
+	StorageMigrationAwaitingReplication StorageMigrationPhase = "AwaitingReplication"
+	// StorageMigrationRecreatingVolume is recreating the node's PVCs at the new spec.
+	StorageMigrationRecreatingVolume StorageMigrationPhase = "RecreatingVolume"
+	// StorageMigrationAwaitingRejoin is waiting for the recreated node to rejoin the layout
+	// and refill from replicas before the next node is migrated.
+	StorageMigrationAwaitingRejoin StorageMigrationPhase = "AwaitingRejoin"
+)
+
+// StorageMigrationStatus reports an in-progress storage migration (PLAN.md §4.5). A change
+// to a pool's volume sizes that the in-place path cannot serve — a shrink, or a grow on a
+// StorageClass that forbids expansion — is carried out by draining one node at a time,
+// recreating its volumes at the new spec, and refilling it from replicas. This block is
+// operator-owned reporting, present only while a migration is underway.
+type StorageMigrationStatus struct {
+	// pool is the node pool being migrated.
+	Pool string `json:"pool"`
+
+	// ordinal is the StatefulSet ordinal of the node currently being migrated.
+	Ordinal int32 `json:"ordinal"`
+
+	// phase is the stage the current node is in.
+	Phase StorageMigrationPhase `json:"phase"`
+
+	// message is a human-readable summary of the current step.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
 // GarageClusterStatus defines the observed state of GarageCluster.
 type GarageClusterStatus struct {
 	// conditions represent the current state of the GarageCluster resource.
@@ -396,6 +440,11 @@ type GarageClusterStatus struct {
 	// maintenance reports operator-triggered metadata snapshot and repair operations.
 	// +optional
 	Maintenance *MaintenanceStatus `json:"maintenance,omitempty"`
+
+	// storageMigration reports an in-progress storage migration. Present only while a
+	// volume change that cannot be served in place is being rolled through the pool.
+	// +optional
+	StorageMigration *StorageMigrationStatus `json:"storageMigration,omitempty"`
 
 	// adminTokenSecret names the Secret holding the Admin API token.
 	// +optional

@@ -24,7 +24,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,15 +32,31 @@ import (
 	garagev1alpha1 "github.com/QuantumDancer/garage-operator/api/v1alpha1"
 )
 
-// conditionStorageChangePending is set (False, reason Blocked) when a requested storage change
-// cannot be carried out in place — a size shrink, or a StorageClass that forbids expansion.
-// The happy-path grow sets no condition: per the design it applies immediately and is reported
-// only via an Event, mirroring how an additive layout change is silent on success.
+// conditionStorageChangePending is set (False, reason Blocked) when a storage migration is
+// refused by a safety guardrail (replicationFactor < 2, or an unhealthy cluster). The
+// in-place grow and the migration's happy path set no condition: they apply and report only
+// via Events, mirroring how an additive layout change is silent on success. The migration
+// step (PLAN.md §4.5) owns this condition; reconcileStorage (the in-place path) never sets it.
 const conditionStorageChangePending = "StorageChangePending"
 
+// storageAction classifies how a volume's requested size change must be served.
+type storageAction int
+
+const (
+	// storageNoChange — the live volume already matches the desired size.
+	storageNoChange storageAction = iota
+	// storageGrowInPlace — the size increased on an expansion-capable StorageClass, so the
+	// existing PVCs can be patched larger (Path A, PLAN.md §5.4).
+	storageGrowInPlace
+	// storageMigrate — a shrink, or a grow the StorageClass cannot expand, so the volume must
+	// be recreated through the migration path (Path B, PLAN.md §4.5).
+	storageMigrate
+)
+
 // reconcileStorage grows the data/meta volumes of each pool in place when their spec sizes
-// have increased (Path A, PLAN.md §5.4). Because a StatefulSet's volumeClaimTemplates are
-// immutable, growing a volume is a two-part operation that this function performs together:
+// have increased on an expansion-capable StorageClass (Path A, PLAN.md §5.4). Because a
+// StatefulSet's volumeClaimTemplates are immutable, growing a volume is a two-part operation
+// performed together:
 //
 //  1. patch every existing per-pod PVC up to the new size (CSI then expands the volume), and
 //  2. delete the StatefulSet with an orphan cascade so the next reconcile recreates it with the
@@ -50,14 +65,14 @@ const conditionStorageChangePending = "StorageChangePending"
 // It returns recreate=true once it has orphan-deleted at least one StatefulSet, so the caller
 // requeues and lets ensureWorkload recreate it cleanly rather than racing the deletion.
 //
-// A shrink, or a StorageClass without allowVolumeExpansion, cannot be served in place: the
-// volume is left as-is and a StorageChangePending=False/Blocked condition + Event explain why
-// (a shrink is routed to the future migration path, PLAN.md §4.5). The operator never blocks on
-// the CSI resize completing (PVC.status.capacity): expansion is assumed online, so reporting the
-// patched request and recreated template is the whole of the operator's contract here.
-func (r *GarageClusterReconciler) reconcileStorage(ctx context.Context, cluster *garagev1alpha1.GarageCluster, status *garagev1alpha1.GarageClusterStatus) (recreate bool, err error) {
+// A change the in-place path cannot serve — a shrink, or a grow on a StorageClass without
+// allowVolumeExpansion — is left untouched here and handled by the migration step
+// (reconcileStorageMigration), which has Admin API access to drain the node first. The
+// operator never blocks on the CSI resize completing (PVC.status.capacity): expansion is
+// assumed online, so reporting the patched request and recreated template is the whole of the
+// in-place contract here.
+func (r *GarageClusterReconciler) reconcileStorage(ctx context.Context, cluster *garagev1alpha1.GarageCluster, _ *garagev1alpha1.GarageClusterStatus) (recreate bool, err error) {
 	log := logf.FromContext(ctx)
-	var blocked []string
 
 	for i := range cluster.Spec.NodePools {
 		pool := &cluster.Spec.NodePools[i]
@@ -91,15 +106,14 @@ func (r *GarageClusterReconciler) reconcileStorage(ctx context.Context, cluster 
 			continue
 		}
 
-		grew, reason, growErr := r.planPoolStorage(ctx, cluster, pool, &ss)
+		grew, migrate, growErr := r.planPoolStorage(ctx, cluster, pool, &ss)
 		if growErr != nil {
 			return false, growErr
 		}
-		if reason != "" {
-			blocked = append(blocked, reason)
-			// A blocked pool is left entirely untouched — neither patched nor recreated — so a
-			// contradictory edit (e.g. grow one volume, shrink the other) never applies half of
-			// itself. The user resolves the block first.
+		if migrate {
+			// The migration step owns this pool: leave the volumes entirely untouched so a
+			// contradictory edit (grow one volume, shrink the other) never half-applies in place
+			// before the migration recreates both from the new template.
 			continue
 		}
 		if !grew {
@@ -115,24 +129,16 @@ func (r *GarageClusterReconciler) reconcileStorage(ctx context.Context, cluster 
 		recreate = true
 	}
 
-	if len(blocked) > 0 {
-		msg := blocked[0]
-		if len(blocked) > 1 {
-			msg = fmt.Sprintf("%s (and %d more)", blocked[0], len(blocked)-1)
-		}
-		setCondition(status, conditionStorageChangePending, metav1.ConditionFalse, "Blocked", msg)
-		r.eventf(cluster, corev1.EventTypeWarning, "StorageChangeBlocked", msg)
-	} else {
-		meta.RemoveStatusCondition(&status.Conditions, conditionStorageChangePending)
-	}
 	return recreate, nil
 }
 
 // planPoolStorage inspects the pool's data and meta volumes against the live StatefulSet and,
-// for any that grew, patches the existing PVCs up. It returns grew=true when at least one
-// volume was expanded (so the StatefulSet must be recreated), or a non-empty reason when the
-// change is refused (shrink, or a StorageClass that forbids expansion).
-func (r *GarageClusterReconciler) planPoolStorage(ctx context.Context, cluster *garagev1alpha1.GarageCluster, pool *garagev1alpha1.NodePool, ss *appsv1.StatefulSet) (grew bool, reason string, err error) {
+// for any that grew in place, patches the existing PVCs up. It returns grew=true when at least
+// one volume was expanded (so the StatefulSet must be recreated), or migrate=true when any
+// volume's change must instead go through the migration path (a shrink, or a grow the
+// StorageClass cannot expand). migrate routes the *whole* pool to migration: its volumes are
+// left untouched here so the migration recreates every PVC from the new template uniformly.
+func (r *GarageClusterReconciler) planPoolStorage(ctx context.Context, cluster *garagev1alpha1.GarageCluster, pool *garagev1alpha1.NodePool, ss *appsv1.StatefulSet) (grew bool, migrate bool, err error) {
 	volumes := []struct {
 		name string
 		spec garagev1alpha1.StorageSpec
@@ -141,51 +147,74 @@ func (r *GarageClusterReconciler) planPoolStorage(ctx context.Context, cluster *
 		{volumeNameMeta, pool.Storage.Meta},
 	}
 
-	// Classify every volume before mutating anything, so a refusal on one volume blocks the
-	// whole pool without having already patched the other.
+	// Classify every volume before mutating anything, so routing the pool to migration leaves
+	// the other volume unpatched.
 	type growth struct {
 		name    string
 		desired resource.Quantity
 	}
 	var grows []growth
 	for _, v := range volumes {
-		current, ok := templateStorageRequest(ss, v.name)
+		action, ok, classifyErr := r.classifyVolume(ctx, cluster.Namespace, ss, v.name, v.spec.Size)
+		if classifyErr != nil {
+			return false, false, classifyErr
+		}
 		if !ok {
-			// The template should always carry both claims; if not, the StatefulSet predates this
-			// operator's invariants — leave it alone rather than guess.
-			continue
+			// Not yet classifiable (the volume's PVC is not provisioned yet): defer the whole
+			// pool rather than grow only the other volume and recreate against a template this
+			// volume's PVC has not caught up to. The next reconcile retries once the claim appears.
+			return false, false, nil
 		}
-		switch v.spec.Size.Cmp(current) {
-		case 0:
-			continue
-		case -1:
-			return false, fmt.Sprintf("pool %q %s volume cannot shrink from %s to %s in place; use a storage migration",
-				pool.Name, v.name, current.String(), v.spec.Size.String()), nil
+		switch action {
+		case storageMigrate:
+			return false, true, nil
+		case storageGrowInPlace:
+			grows = append(grows, growth{name: v.name, desired: v.spec.Size})
 		}
-		expandable, scReason, scErr := r.storageClassExpandable(ctx, cluster.Namespace, ss.Name, v.name)
-		if scErr != nil {
-			return false, "", scErr
-		}
-		if !expandable {
-			if scReason == "" {
-				// Transient (the volume's PVC is not provisioned yet): defer the whole pool's grow
-				// rather than refuse it, and rather than grow only the other volume and then
-				// recreate the StatefulSet with a template this volume's PVC has not caught up to.
-				// The next reconcile retries once the claim appears.
-				return false, "", nil
-			}
-			return false, fmt.Sprintf("pool %q %s volume cannot grow: %s", pool.Name, v.name, scReason), nil
-		}
-		grows = append(grows, growth{name: v.name, desired: v.spec.Size})
 	}
 
 	for _, g := range grows {
 		if err := r.expandClaims(ctx, cluster.Namespace, ss.Name, g.name, replicaCount(ss), g.desired); err != nil {
-			return false, "", err
+			return false, false, err
 		}
 		grew = true
 	}
-	return grew, "", nil
+	return grew, false, nil
+}
+
+// classifyVolume decides how a single volume's size change is served by comparing the desired
+// size against what the live StatefulSet template provisions. A grow is served in place only
+// when the backing StorageClass allows expansion; a shrink, or a grow the class cannot expand,
+// must go through the migration path. The bool return is false when classification is not yet
+// possible (the claim is not provisioned), so the caller defers rather than acts.
+func (r *GarageClusterReconciler) classifyVolume(ctx context.Context, namespace string, ss *appsv1.StatefulSet, volume string, desired resource.Quantity) (storageAction, bool, error) {
+	current, ok := templateStorageRequest(ss, volume)
+	if !ok {
+		// The template should always carry both claims; if not, the StatefulSet predates this
+		// operator's invariants — leave it alone rather than guess.
+		return storageNoChange, true, nil
+	}
+	switch desired.Cmp(current) {
+	case 0:
+		return storageNoChange, true, nil
+	case -1:
+		// A PVC can never shrink in place, so any shrink is a migration regardless of the class.
+		return storageMigrate, true, nil
+	}
+	expandable, scReason, err := r.storageClassExpandable(ctx, namespace, ss.Name, volume)
+	if err != nil {
+		return storageNoChange, false, err
+	}
+	if expandable {
+		return storageGrowInPlace, true, nil
+	}
+	if scReason == "" {
+		// Transient: the ordinal-0 claim is not provisioned yet, so expansion support cannot be
+		// determined. Defer rather than misclassify.
+		return storageNoChange, false, nil
+	}
+	// The class cannot expand the volume, so even a grow must recreate it through migration.
+	return storageMigrate, true, nil
 }
 
 // templateStorageRequest returns the storage request the StatefulSet's volumeClaimTemplate for
