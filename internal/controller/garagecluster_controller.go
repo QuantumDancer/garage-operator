@@ -76,6 +76,9 @@ type clusterAdmin interface {
 	ApplyLayout(ctx context.Context, version int64) error
 	RevertStagedChanges(ctx context.Context) error
 	Health(ctx context.Context) (*garageadmin.GetClusterHealthResponse, error)
+	CreateMetadataSnapshot(ctx context.Context, node string) (garageadmin.MultiNodeResult, error)
+	LaunchRepair(ctx context.Context, node, repairType string) (garageadmin.MultiNodeResult, error)
+	ListActiveWorkers(ctx context.Context, node string) ([]garageadmin.WorkerSummary, error)
 }
 
 // GarageClusterReconciler reconciles a GarageCluster object
@@ -195,6 +198,10 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		setCondition(status, conditionReady, metav1.ConditionFalse, "LayoutError", err.Error())
 		return ctrl.Result{}, err
 	}
+
+	// Run annotation-triggered day-2 maintenance (metadata snapshot, repair) once the cluster
+	// is converged and reachable. It is best-effort and never gates Ready.
+	r.reconcileMaintenance(ctx, &cluster, status, layoutClient)
 
 	setCondition(status, conditionReady, metav1.ConditionTrue, "ClusterReady", "Garage cluster is ready")
 	return r.finish(ctx, &cluster, status, ctrl.Result{RequeueAfter: steadyStateRequeue})

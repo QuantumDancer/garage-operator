@@ -40,6 +40,20 @@ type fakeAdmin struct {
 	// When nil the server reports success for every requested peer.
 	connectResults []ConnectNodeResponse
 	connectBodies  []ConnectClusterNodesRequest
+
+	// Maintenance endpoints. The *Success/*Error maps are returned verbatim as the fan-out
+	// response; repairBodies records the RepairType the client sent; workers is the per-node
+	// worker list ListWorkers returns. snapshotNode/repairNode/workersNode capture the node
+	// query parameter.
+	snapshotSuccess map[string]any
+	snapshotError   map[string]string
+	snapshotNode    string
+	repairSuccess   map[string]any
+	repairError     map[string]string
+	repairBodies    []LocalLaunchRepairOperationRequest
+	repairNode      string
+	workers         map[string][]WorkerInfoResp
+	workersNode     string
 }
 
 func (f *fakeAdmin) server() *httptest.Server {
@@ -107,6 +121,27 @@ func (f *fakeAdmin) server() *httptest.Server {
 		case "/v2/RevertClusterLayout":
 			f.revertCalls++
 			f.encode(w, f.layout)
+		case "/v2/CreateMetadataSnapshot":
+			f.snapshotNode = r.URL.Query().Get("node")
+			f.encode(w, MultiResponseLocalCreateMetadataSnapshotResponse{
+				Success: f.snapshotSuccess,
+				Error:   f.snapshotError,
+			})
+		case "/v2/LaunchRepairOperation":
+			f.repairNode = r.URL.Query().Get("node")
+			var body LocalLaunchRepairOperationRequest
+			f.decode(r, &body)
+			f.repairBodies = append(f.repairBodies, body)
+			f.encode(w, MultiResponseLocalLaunchRepairOperationResponse{
+				Success: f.repairSuccess,
+				Error:   f.repairError,
+			})
+		case "/v2/ListWorkers":
+			f.workersNode = r.URL.Query().Get("node")
+			f.encode(w, MultiResponseLocalListWorkersResponse{
+				Success: f.workers,
+				Error:   map[string]string{},
+			})
 		default:
 			f.t.Errorf("unexpected request path %q", r.URL.Path)
 			http.Error(w, "unexpected", http.StatusNotFound)

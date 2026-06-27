@@ -1467,6 +1467,66 @@ spec:
                 required:
                 - version
                 type: object
+              maintenance:
+                description: maintenance reports operator-triggered metadata snapshot
+                  and repair operations.
+                properties:
+                  repair:
+                    description: repair reports the most recent repair operation.
+                    properties:
+                      observedTrigger:
+                        description: |-
+                          observedTrigger is the garage.rottler.io/repair annotation value last acted on.
+                          A repair launches once when this value changes; bumping it (e.g. "blocks@2") relaunches.
+                        type: string
+                      progress:
+                        description: progress is a free-form summary of the active
+                          background workers, while any are running.
+                        type: string
+                      state:
+                        description: |-
+                          state is Launched, Running, Done, or Failed. Running/Done are best-effort, derived from
+                          Garage's background-worker activity, which may reflect unrelated maintenance.
+                        type: string
+                      time:
+                        description: time is when the repair was launched.
+                        format: date-time
+                        type: string
+                      type:
+                        description: type is the repair type that was launched.
+                        type: string
+                    required:
+                    - observedTrigger
+                    - state
+                    - time
+                    - type
+                    type: object
+                  snapshot:
+                    description: snapshot reports the most recent metadata-snapshot
+                      request.
+                    properties:
+                      message:
+                        description: message summarizes the per-node outcome.
+                        type: string
+                      observedTrigger:
+                        description: |-
+                          observedTrigger is the garage.rottler.io/snapshot annotation value last acted on.
+                          A snapshot runs once when this value changes; bumping it requests another.
+                        type: string
+                      result:
+                        description: result is Succeeded, Partial (some nodes failed),
+                          or Failed (all nodes failed).
+                        type: string
+                      time:
+                        description: time is when the snapshot was requested.
+                        format: date-time
+                        type: string
+                    required:
+                    - observedTrigger
+                    - result
+                    - time
+                    type: object
+                type: object
               observedGeneration:
                 description: observedGeneration is the generation most recently reconciled
                   into status.

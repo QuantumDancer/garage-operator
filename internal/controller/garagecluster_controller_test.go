@@ -95,12 +95,61 @@ func (l *fakeLayout) apply(version int64) {
 	l.applyCalls++
 }
 
+// fakeMaintenance records the maintenance calls one or more fake admin clients receive and
+// supplies the responses they return. A single instance is shared across the per-pod clients a
+// reconcile creates (like fakeLayout), so a test can drive and assert maintenance across passes.
+type fakeMaintenance struct {
+	snapshotCalls int
+	repairCalls   int
+	repairTypes   []string
+
+	// snapshotResult / repairResult override the default single-node success when set.
+	snapshotResult *garageadmin.MultiNodeResult
+	repairResult   *garageadmin.MultiNodeResult
+
+	// workers is returned from ListActiveWorkers (default: none, i.e. a finished repair).
+	workers []garageadmin.WorkerSummary
+}
+
 // fakeClusterAdmin stands in for the Garage Admin API so reconcile logic can run in envtest,
 // where no real Garage process exists.
 type fakeClusterAdmin struct {
 	nodeID   string
 	recorder *meshRecorder
 	layout   *fakeLayout
+	maint    *fakeMaintenance
+}
+
+func (f *fakeClusterAdmin) CreateMetadataSnapshot(context.Context, string) (garageadmin.MultiNodeResult, error) {
+	if f.maint != nil {
+		f.maint.snapshotCalls++
+		if f.maint.snapshotResult != nil {
+			return *f.maint.snapshotResult, nil
+		}
+	}
+	return garageadmin.MultiNodeResult{Succeeded: []string{f.nodeID}}, nil
+}
+
+func (f *fakeClusterAdmin) LaunchRepair(_ context.Context, _, repairType string) (garageadmin.MultiNodeResult, error) {
+	// Mirror the real client, which rejects an unknown type before contacting Garage.
+	if !garageadmin.IsValidRepairType(repairType) {
+		return garageadmin.MultiNodeResult{}, garageadmin.ErrUnknownRepairType
+	}
+	if f.maint != nil {
+		f.maint.repairCalls++
+		f.maint.repairTypes = append(f.maint.repairTypes, repairType)
+		if f.maint.repairResult != nil {
+			return *f.maint.repairResult, nil
+		}
+	}
+	return garageadmin.MultiNodeResult{Succeeded: []string{f.nodeID}}, nil
+}
+
+func (f *fakeClusterAdmin) ListActiveWorkers(context.Context, string) ([]garageadmin.WorkerSummary, error) {
+	if f.maint != nil {
+		return f.maint.workers, nil
+	}
+	return nil, nil
 }
 
 func (f *fakeClusterAdmin) NodeID(context.Context) (string, error) { return f.nodeID, nil }
@@ -183,7 +232,7 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			NewAdminClient: func(string, string) (clusterAdmin, error) {
-				return &fakeClusterAdmin{nodeID: "node-self", recorder: mesh, layout: layout}, nil
+				return &fakeClusterAdmin{nodeID: nodeSelf, recorder: mesh, layout: layout}, nil
 			},
 		}
 	}

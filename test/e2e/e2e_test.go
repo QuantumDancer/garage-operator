@@ -630,6 +630,83 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", scFile))
 		})
 
+		It("should take a metadata snapshot and launch a repair when annotated", func() {
+			const clusterNamespace = "garage-maint-e2e"
+			const clusterName = "maint"
+
+			By("preloading the Garage image into the Kind cluster")
+			_, err := utils.Run(exec.Command("docker", "pull", garageImage))
+			Expect(err).NotTo(HaveOccurred(), "Failed to pull the Garage image")
+			Expect(utils.LoadImageToKindClusterWithName(garageImage)).To(Succeed(), "Failed to load Garage image into Kind")
+
+			By("creating the maintenance-test namespace")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", clusterNamespace))
+
+			By("applying a single-node GarageCluster")
+			manifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicationFactor: 1
+  nodePools:
+    - name: default
+      replicas: 1
+      storage:
+        data: { size: 1Gi }
+        meta: { size: 1Gi }
+`, clusterName, clusterNamespace)
+			manifestFile := filepath.Join("/tmp", "garagecluster-maint-e2e.yaml")
+			Expect(os.WriteFile(manifestFile, []byte(manifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", manifestFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
+
+			getStatus := func(jsonPath string) (string, error) {
+				return utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", clusterNamespace, "-o", "jsonpath="+jsonPath))
+			}
+
+			By("waiting for the cluster to become Ready")
+			Eventually(func(g Gomega) {
+				ready, err := getStatus("{.status.conditions[?(@.type=='Ready')].status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "GarageCluster is not Ready")
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("annotating the cluster to trigger a metadata snapshot and a blocks repair")
+			_, err = utils.Run(exec.Command("kubectl", "annotate", "garagecluster", clusterName,
+				"-n", clusterNamespace, "--overwrite",
+				"garage.rottler.io/snapshot=snap-1", "garage.rottler.io/repair=blocks"))
+			Expect(err).NotTo(HaveOccurred(), "Failed to annotate GarageCluster")
+
+			By("asserting the snapshot succeeded and the repair launched against real Garage")
+			Eventually(func(g Gomega) {
+				snapTrigger, err := getStatus("{.status.maintenance.snapshot.observedTrigger}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(snapTrigger).To(Equal("snap-1"), "snapshot trigger not yet acted on")
+
+				snapResult, err := getStatus("{.status.maintenance.snapshot.result}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(snapResult).To(Equal("Succeeded"), "real Garage rejected the metadata snapshot")
+
+				repairType, err := getStatus("{.status.maintenance.repair.type}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(repairType).To(Equal("blocks"), "repair type not recorded")
+
+				repairState, err := getStatus("{.status.maintenance.repair.state}")
+				g.Expect(err).NotTo(HaveOccurred())
+				// The repair is fire-and-forget; on a fresh cluster it may already be Done, but it
+				// must never be Failed (real Garage accepted the launch).
+				g.Expect(repairState).To(BeElementOf("Launched", "Running", "Done"),
+					"repair was not launched successfully (state=%s)", repairState)
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("cleaning up the GarageCluster")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
+		})
+
 		It("should provision a GarageBucket against a single-node cluster", func() {
 			const bucketNamespace = "garage-bucket-e2e"
 			const clusterName = "bkt"

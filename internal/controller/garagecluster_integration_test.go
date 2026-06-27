@@ -50,7 +50,7 @@ var _ = Describe("GarageCluster storage growth integration", Ordered, func() {
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			NewAdminClient: func(string, string) (clusterAdmin, error) {
-				return &fakeClusterAdmin{nodeID: "node-self", recorder: &meshRecorder{}, layout: newFakeLayout()}, nil
+				return &fakeClusterAdmin{nodeID: nodeSelf, recorder: &meshRecorder{}, layout: newFakeLayout()}, nil
 			},
 			Recorder: record.NewFakeRecorder(100),
 		}
@@ -166,5 +166,81 @@ var _ = Describe("GarageCluster storage growth integration", Ordered, func() {
 		Expect(k8sClient.Get(ctx, ssKey, &ss)).To(Succeed())
 		got, _ := templateStorageRequest(&ss, volumeNameData)
 		Expect(got.Cmp(resource.MustParse("2Gi"))).To(Equal(0))
+	})
+})
+
+// This envtest spec proves the annotation-triggered maintenance path is wired into Reconcile
+// against a real API server, and that the generated CRD status schema accepts the maintenance
+// block. It drives a single-node cluster to Ready, then triggers a snapshot and a repair via
+// annotations and asserts the recorded outcome survives a status round-trip.
+var _ = Describe("GarageCluster maintenance integration", Ordered, func() {
+	const (
+		itNamespace = "garage-cluster-maint-it"
+		clusterName = "maintcluster"
+	)
+
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(string, string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeSelf, recorder: &meshRecorder{}, layout: newFakeLayout()}, nil
+			},
+			Recorder: record.NewFakeRecorder(100),
+		}
+	}
+
+	clusterKey := client.ObjectKey{Name: clusterName, Namespace: itNamespace}
+	ssKey := client.ObjectKey{Name: clusterName + "-default", Namespace: itNamespace}
+
+	BeforeAll(func() {
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: itNamespace},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: itNamespace},
+			Spec:       newBasicClusterSpec(1, 1),
+		})).To(Succeed())
+	})
+
+	AfterAll(func() {
+		cluster := &garagev1alpha1.GarageCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: itNamespace}}
+		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, cluster))).To(Succeed())
+	})
+
+	It("drives the cluster to Ready", func() {
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("marking the StatefulSet ready (envtest has no kubelet to do it)")
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, ssKey, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = 1
+		ss.Status.ReadyReplicas = 1
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("runs a snapshot and a repair when the annotations are set, recording the outcome", func() {
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, clusterKey, &cluster)).To(Succeed())
+		cluster.Annotations = map[string]string{
+			annotationSnapshot: "snap-1",
+			annotationRepair:   repairBlocks,
+		}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, clusterKey, &cluster)).To(Succeed())
+		Expect(cluster.Status.Maintenance).NotTo(BeNil())
+		Expect(cluster.Status.Maintenance.Snapshot.ObservedTrigger).To(Equal("snap-1"))
+		Expect(cluster.Status.Maintenance.Snapshot.Result).To(Equal(resultSucceeded))
+		Expect(cluster.Status.Maintenance.Repair.Type).To(Equal(repairBlocks))
+		Expect(cluster.Status.Maintenance.Repair.State).To(Equal(stateLaunched))
 	})
 })
