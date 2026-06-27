@@ -23,9 +23,9 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -145,6 +145,19 @@ func (r *GarageClusterReconciler) migrationDrain(ctx context.Context, cluster *g
 		return r.blockMigration(cluster, status,
 			fmt.Sprintf("Refusing storage migration of pool %q: replicationFactor %d leaves no replica to recover a drained node's data",
 				step.pool.Name, cluster.Spec.ReplicationFactor)), nil
+	}
+
+	// Guardrail: the migration recreates the node's PVCs on the pool's desired StorageClass. If
+	// that class is empty or does not exist (a typo, or an explicit ""), the recreated PVC would
+	// never bind — and by the time that shows the node is already drained and wiped, leaving it
+	// stuck unrecoverably. Refuse before the destructive drain, mirroring the in-place path, which
+	// validates the class up front. A nil class (the cluster default) is resolved by the API server
+	// at bind time and is always allowed.
+	if reason, err := r.unresolvableStorageClass(ctx, step.pool); err != nil {
+		return false, err
+	} else if reason != "" {
+		return r.blockMigration(cluster, status,
+			fmt.Sprintf("Refusing storage migration of pool %q: %s", step.pool.Name, reason)), nil
 	}
 
 	node, ok := nodeEndpointForOrdinal(desired, cluster, step.pool, step.ordinal)
@@ -305,7 +318,7 @@ func (r *GarageClusterReconciler) migrationAwaitRejoin(ctx context.Context, clus
 // path, keeping the node's pending capacity change from being applied while the volume is
 // unchanged.
 func (r *GarageClusterReconciler) blockMigration(cluster *garagev1alpha1.GarageCluster, status *garagev1alpha1.GarageClusterStatus, msg string) bool {
-	setCondition(status, conditionStorageChangePending, metav1.ConditionFalse, "Blocked", msg)
+	setCondition(status, conditionStorageChangePending, metav1.ConditionFalse, reasonBlocked, msg)
 	r.eventf(cluster, corev1.EventTypeWarning, "StorageChangeBlocked", msg)
 	status.StorageMigration = nil
 	return true
@@ -322,17 +335,17 @@ func (r *GarageClusterReconciler) setMigrationStatus(status *garagev1alpha1.Gara
 }
 
 // poolMigrationTarget returns the lowest ordinal in the pool whose volumes need a migration —
-// a shrink, or a grow on a StorageClass that cannot expand — comparing each node's live PVCs
-// against the desired pool sizes. Expandable grows are excluded: those are the in-place path's
-// job (and the StatefulSet is recreated only once Path A has patched every PVC). A node whose
-// PVC is not yet provisioned is skipped rather than treated as a target.
+// a StorageClass change, a shrink, or a grow on a StorageClass that cannot expand — comparing
+// each node's live PVCs against the desired pool spec. Expandable grows are excluded: those are
+// the in-place path's job (and the StatefulSet is recreated only once Path A has patched every
+// PVC). A node whose PVC is not yet provisioned is skipped rather than treated as a target.
 func (r *GarageClusterReconciler) poolMigrationTarget(ctx context.Context, cluster *garagev1alpha1.GarageCluster, pool *garagev1alpha1.NodePool, ss *appsv1.StatefulSet) (int32, bool, error) {
 	volumes := []struct {
-		name    string
-		desired resource.Quantity
+		name string
+		spec garagev1alpha1.StorageSpec
 	}{
-		{volumeNameData, pool.Storage.Data.Size},
-		{volumeNameMeta, pool.Storage.Meta.Size},
+		{volumeNameData, pool.Storage.Data},
+		{volumeNameMeta, pool.Storage.Meta},
 	}
 	for ordinal := int32(0); ordinal < replicaCount(ss); ordinal++ {
 		for _, v := range volumes {
@@ -343,8 +356,13 @@ func (r *GarageClusterReconciler) poolMigrationTarget(ctx context.Context, clust
 			if pvc == nil {
 				continue // not provisioned yet; cannot classify.
 			}
+			// A StorageClass change can never be served in place (storageClassName is immutable),
+			// so it is a migration regardless of any size change.
+			if !pvcClassMatches(pvc, v.spec.StorageClass) {
+				return ordinal, true, nil
+			}
 			current := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-			switch v.desired.Cmp(current) {
+			switch v.spec.Size.Cmp(current) {
 			case 0:
 				continue
 			case -1:
@@ -361,6 +379,29 @@ func (r *GarageClusterReconciler) poolMigrationTarget(ctx context.Context, clust
 		}
 	}
 	return 0, false, nil
+}
+
+// unresolvableStorageClass returns a human-readable reason when a StorageClass the pool's volumes
+// explicitly request cannot back a PVC — it is empty, or no such StorageClass exists — or "" when
+// every requested class is resolvable. A nil class (the cluster default) is always allowed: the
+// API server resolves it at bind time, so there is nothing for the operator to validate.
+func (r *GarageClusterReconciler) unresolvableStorageClass(ctx context.Context, pool *garagev1alpha1.NodePool) (string, error) {
+	for _, class := range []*string{pool.Storage.Data.StorageClass, pool.Storage.Meta.StorageClass} {
+		if class == nil {
+			continue
+		}
+		if *class == "" {
+			return "a volume requests an empty StorageClass, which cannot provision a volume", nil
+		}
+		var sc storagev1.StorageClass
+		if err := r.Get(ctx, client.ObjectKey{Name: *class}, &sc); err != nil {
+			if apierrors.IsNotFound(err) {
+				return fmt.Sprintf("StorageClass %q was not found", *class), nil
+			}
+			return "", err
+		}
+	}
+	return "", nil
 }
 
 // ordinalVolumeState classifies a node's volumes during the recreate phase.
@@ -386,11 +427,11 @@ const (
 func (r *GarageClusterReconciler) ordinalVolumeState(ctx context.Context, cluster *garagev1alpha1.GarageCluster, pool *garagev1alpha1.NodePool, ordinal int32) (ordinalVolumeState, error) {
 	ssName := statefulSetName(cluster, pool)
 	volumes := []struct {
-		name    string
-		desired resource.Quantity
+		name string
+		spec garagev1alpha1.StorageSpec
 	}{
-		{volumeNameData, pool.Storage.Data.Size},
-		{volumeNameMeta, pool.Storage.Meta.Size},
+		{volumeNameData, pool.Storage.Data},
+		{volumeNameMeta, pool.Storage.Meta},
 	}
 	allMatch := true
 	oldClaimPresent := false
@@ -405,9 +446,10 @@ func (r *GarageClusterReconciler) ordinalVolumeState(ctx context.Context, cluste
 		case pvc.DeletionTimestamp != nil:
 			allMatch = false
 			oldClaimPresent = true // still draining; its holder pod must go.
-		case v.desired.Cmp(pvc.Spec.Resources.Requests[corev1.ResourceStorage]) != 0:
+		case v.spec.Size.Cmp(pvc.Spec.Resources.Requests[corev1.ResourceStorage]) != 0,
+			!pvcClassMatches(pvc, v.spec.StorageClass):
 			allMatch = false
-			oldClaimPresent = true // old claim at the wrong size.
+			oldClaimPresent = true // old claim at the wrong size or StorageClass.
 		}
 	}
 	switch {
@@ -457,13 +499,37 @@ func (r *GarageClusterReconciler) getStatefulSet(ctx context.Context, cluster *g
 }
 
 // templateMatchesPool reports whether the StatefulSet's volumeClaimTemplates already provision
-// the pool's desired data and meta sizes.
+// the pool's desired data and meta sizes and StorageClasses. The class comparison is exact (an
+// omitted class is a nil template class) rather than the resolved-default comparison used against
+// live PVCs, because the template mirrors the spec verbatim — the API server never rewrites it.
 func templateMatchesPool(ss *appsv1.StatefulSet, pool *garagev1alpha1.NodePool) bool {
 	data, okData := templateStorageRequest(ss, volumeNameData)
 	mta, okMeta := templateStorageRequest(ss, volumeNameMeta)
 	return okData && okMeta &&
 		data.Cmp(pool.Storage.Data.Size) == 0 &&
-		mta.Cmp(pool.Storage.Meta.Size) == 0
+		mta.Cmp(pool.Storage.Meta.Size) == 0 &&
+		templateClassMatches(ss, volumeNameData, pool.Storage.Data.StorageClass) &&
+		templateClassMatches(ss, volumeNameMeta, pool.Storage.Meta.StorageClass)
+}
+
+// templateClassMatches reports whether the StatefulSet's volumeClaimTemplate for the volume
+// already requests the desired StorageClass, comparing the two *string values exactly (both nil,
+// or both the same name).
+func templateClassMatches(ss *appsv1.StatefulSet, volume string, desired *string) bool {
+	tmpl := templateStorageClass(ss, volume)
+	if (tmpl == nil) != (desired == nil) {
+		return false
+	}
+	return tmpl == nil || *tmpl == *desired
+}
+
+// templateStorageClass returns the StorageClass the StatefulSet's volumeClaimTemplate for the
+// named volume requests, or nil when the template has no such claim or requests no class.
+func templateStorageClass(ss *appsv1.StatefulSet, volume string) *string {
+	if vct := templateClaim(ss, volume); vct != nil {
+		return vct.Spec.StorageClassName
+	}
+	return nil
 }
 
 // nodeEndpointForOrdinal finds the discovered node for a pool ordinal by its pod name.

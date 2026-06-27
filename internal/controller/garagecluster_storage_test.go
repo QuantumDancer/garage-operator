@@ -230,6 +230,36 @@ func TestReconcileStorageRoutesNonExpandableGrowToMigration(t *testing.T) {
 	}
 }
 
+// TestReconcileStorageRoutesStorageClassChangeToMigration proves the in-place path never tries to
+// serve a StorageClass change (storageClassName is immutable): with sizes unchanged, an explicit
+// class differing from the live PVC's class is left for the migration step — no PVC patch, no
+// recreate, no condition.
+func TestReconcileStorageRoutesStorageClassChangeToMigration(t *testing.T) {
+	fx := newStorageFixture("1Gi", "1Gi", "1Gi", 1, true)
+	// The live PVCs are on expandableStorageClass; ask for a different class.
+	fx.cluster.Spec.NodePools[0].Storage.Data.StorageClass = ptr.To("fast")
+	r, c := newStorageReconciler(t, fx.objs...)
+	status := &garagev1alpha1.GarageClusterStatus{}
+
+	recreate, err := r.reconcileStorage(context.Background(), fx.cluster, status)
+	if err != nil {
+		t.Fatalf("reconcileStorage: %v", err)
+	}
+	if recreate {
+		t.Fatal("expected recreate=false: a StorageClass change is left for the migration step")
+	}
+	if got := claimSize(t, c, ssName(), volumeNameData, 0); got.Cmp(resource.MustParse("1Gi")) != 0 {
+		t.Errorf("data claim = %s, want 1Gi (unchanged)", got.String())
+	}
+	var ss appsv1.StatefulSet
+	if err := c.Get(context.Background(), types.NamespacedName{Name: ssName(), Namespace: testClusterNS}, &ss); err != nil {
+		t.Errorf("StatefulSet should still exist: %v", err)
+	}
+	if meta.FindStatusCondition(status.Conditions, conditionStorageChangePending) != nil {
+		t.Error("expected no StorageChangePending condition from the in-place path")
+	}
+}
+
 func TestReconcileStorageNoopWhenSizesMatch(t *testing.T) {
 	fx := newStorageFixture("1Gi", "1Gi", "1Gi", 1, true)
 	r, c := newStorageReconciler(t, fx.objs...)

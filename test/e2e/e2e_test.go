@@ -736,6 +736,140 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
 		})
 
+		It("should migrate a node's storage when its data StorageClass is changed", func() {
+			const clusterNamespace = "garage-class-e2e"
+			const clusterName = "class"
+			const ssName = "class-default"
+			const classA = "garage-class-a"
+			const classB = "garage-class-b"
+
+			By("preloading the Garage image into the Kind cluster")
+			_, err := utils.Run(exec.Command("docker", "pull", garageImage))
+			Expect(err).NotTo(HaveOccurred(), "Failed to pull the Garage image")
+			Expect(utils.LoadImageToKindClusterWithName(garageImage)).To(Succeed(), "Failed to load Garage image into Kind")
+
+			By("creating the class-change-test namespace")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", clusterNamespace))
+
+			// Two StorageClasses backed by the same local-path provisioner. A StorageClass change
+			// can never be served in place — a PVC's storageClassName is immutable — so the
+			// operator drains, recreates the volume on the new class, and refills each node in
+			// turn, exactly like a shrink. The classes need not differ in capability; only the
+			// name on the PVC changes.
+			By("creating two local-path-backed StorageClasses")
+			scManifest := fmt.Sprintf(`apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: %s
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: %s
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+`, classA, classB)
+			scFile := filepath.Join("/tmp", "garage-class-scs.yaml")
+			Expect(os.WriteFile(scFile, []byte(scManifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", scFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply StorageClasses")
+
+			// replicationFactor 2 with 3 nodes: draining one node for recreation still leaves two,
+			// so the cluster re-replicates fully (the migration's safety gate) and stays healthy.
+			By("applying a 3-node, replication-factor-2 GarageCluster on StorageClass A")
+			manifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicationFactor: 2
+  nodePools:
+    - name: default
+      replicas: 3
+      storage:
+        data: { size: 1Gi, storageClass: %s }
+        meta: { size: 1Gi, storageClass: %s }
+`, clusterName, clusterNamespace, classA, classA)
+			manifestFile := filepath.Join("/tmp", "garagecluster-class-e2e.yaml")
+			Expect(os.WriteFile(manifestFile, []byte(manifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", manifestFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
+
+			getStatus := func(jsonPath string) (string, error) {
+				return utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", clusterNamespace, "-o", "jsonpath="+jsonPath))
+			}
+
+			By("waiting for the 3-node cluster to become Ready on StorageClass A")
+			Eventually(func(g Gomega) {
+				ready, err := getStatus("{.status.conditions[?(@.type=='Ready')].status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "GarageCluster is not Ready")
+				nodes, err := getStatus("{.status.layout.nodes[*].nodeId}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(utils.GetNonEmptyLines(strings.ReplaceAll(nodes, " ", "\n"))).
+					To(HaveLen(3), "all three nodes should be in the layout")
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("changing the data StorageClass from A to B")
+			_, err = utils.Run(exec.Command("kubectl", "patch", "garagecluster", clusterName,
+				"-n", clusterNamespace, "--type=json",
+				"-p", fmt.Sprintf(`[{"op":"replace","path":"/spec/nodePools/0/storage/data/storageClass","value":"%s"}]`, classB)))
+			Expect(err).NotTo(HaveOccurred(), "Failed to patch data storageClass")
+
+			By("observing the migration take over (Ready reports StorageMigrating)")
+			Eventually(func(g Gomega) {
+				reason, err := getStatus("{.status.conditions[?(@.type=='Ready')].reason}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(reason).To(Equal("StorageMigrating"), "the migration should take over the layout")
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("migrating every node in turn: all three data PVCs end up on StorageClass B")
+			Eventually(func(g Gomega) {
+				for ordinal := 0; ordinal < 3; ordinal++ {
+					class, err := utils.Run(exec.Command("kubectl", "get", "pvc",
+						fmt.Sprintf("data-%s-%d", ssName, ordinal), "-n", clusterNamespace,
+						"-o", "jsonpath={.spec.storageClassName}"))
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(class).To(Equal(classB), "node %d data PVC should be recreated on class B", ordinal)
+				}
+			}, 12*time.Minute, 10*time.Second).Should(Succeed())
+
+			By("converging: migration cleared, meta untouched on A, cluster healthy with 3 nodes")
+			Eventually(func(g Gomega) {
+				phase, err := getStatus("{.status.storageMigration.phase}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(phase).To(BeEmpty(), "the migration should be complete")
+
+				ready, err := getStatus("{.status.conditions[?(@.type=='Ready')].reason}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("ClusterReady"), "the cluster should return to a steady Ready")
+
+				// Only the data class was changed; the meta volume stays on A throughout.
+				metaClass, err := utils.Run(exec.Command("kubectl", "get", "pvc",
+					"meta-"+ssName+"-0", "-n", clusterNamespace, "-o", "jsonpath={.spec.storageClassName}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(metaClass).To(Equal(classA), "the meta volume's class should be unchanged")
+
+				health, err := getStatus("{.status.health.status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(health).To(Equal("healthy"), "cluster should be healthy after the migration")
+
+				nodes, err := getStatus("{.status.layout.nodes[*].nodeId}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(utils.GetNonEmptyLines(strings.ReplaceAll(nodes, " ", "\n"))).
+					To(HaveLen(3), "all three nodes should be back in the layout")
+			}, 5*time.Minute, 10*time.Second).Should(Succeed())
+
+			By("cleaning up the GarageCluster and StorageClasses")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", scFile))
+		})
+
 		It("should take a metadata snapshot and launch a repair when annotated", func() {
 			const clusterNamespace = "garage-maint-e2e"
 			const clusterName = "maint"
