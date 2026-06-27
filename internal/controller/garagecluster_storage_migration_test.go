@@ -161,7 +161,7 @@ func TestMigrationBlockedBelowReplicationFactor(t *testing.T) {
 		t.Error("a blocked migration records no in-progress node")
 	}
 	cond := meta.FindStatusCondition(status.Conditions, conditionStorageChangePending)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Blocked" {
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonBlocked {
 		t.Fatalf("expected StorageChangePending=False/Blocked, got %+v", cond)
 	}
 }
@@ -185,7 +185,7 @@ func TestMigrationBlockedWhenUnhealthy(t *testing.T) {
 		t.Error("an unhealthy cluster must not be drained")
 	}
 	cond := meta.FindStatusCondition(status.Conditions, conditionStorageChangePending)
-	if cond == nil || cond.Reason != "Blocked" {
+	if cond == nil || cond.Reason != reasonBlocked {
 		t.Fatalf("expected StorageChangePending Blocked, got %+v", cond)
 	}
 }
@@ -407,7 +407,7 @@ func TestMigrationNoneNeededClearsCondition(t *testing.T) {
 	r, _, cluster, desired := migrationWorld(t, "1Gi", "1Gi", "1Gi", 2, 2, true)
 	admin := &fakeClusterAdmin{layout: seededLayout(2), health: health(healthStatusHealthy, 256)}
 	status := healthyStatus()
-	setCondition(status, conditionStorageChangePending, metav1.ConditionFalse, "Blocked", "stale")
+	setCondition(status, conditionStorageChangePending, metav1.ConditionFalse, reasonBlocked, "stale")
 
 	active, err := r.reconcileStorageMigration(context.Background(), cluster, status, admin, desired)
 	if err != nil {
@@ -460,5 +460,199 @@ func TestMigrationPicksUpNonExpandableGrow(t *testing.T) {
 	}
 	if _, in := layout.applied["node-0"]; in {
 		t.Error("expected node-0 drained for the non-expandable grow migration")
+	}
+}
+
+// TestMigrationPicksUpStorageClassChange proves the third trigger: with sizes unchanged, an
+// explicit StorageClass that differs from the live PVC's class starts a migration (a PVC's
+// storageClassName cannot be edited in place).
+func TestMigrationPicksUpStorageClassChange(t *testing.T) {
+	r, c, cluster, desired := migrationWorld(t, "1Gi", "1Gi", "1Gi", 2, 2, true)
+	// Live PVCs are on expandableStorageClass; the spec now asks for a different, existing class.
+	const targetClass = "fast"
+	if err := c.Create(context.Background(), &storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: targetClass}}); err != nil {
+		t.Fatalf("create StorageClass: %v", err)
+	}
+	cluster.Spec.NodePools[0].Storage.Data.StorageClass = ptr.To(targetClass)
+	layout := seededLayout(2)
+	admin := &fakeClusterAdmin{layout: layout, health: health(healthStatusHealthy, 256)}
+	status := healthyStatus()
+
+	active, err := r.reconcileStorageMigration(context.Background(), cluster, status, admin, desired)
+	if err != nil {
+		t.Fatalf("reconcileStorageMigration: %v", err)
+	}
+	if !active {
+		t.Fatal("expected a StorageClass change to start a migration")
+	}
+	if _, in := layout.applied["node-0"]; in {
+		t.Error("expected node-0 drained for the StorageClass-change migration")
+	}
+}
+
+// TestMigrationBlocksUnresolvableStorageClass proves the safety guardrail: a class change targeting
+// a StorageClass that cannot back a PVC — missing, or an explicit "" — is refused *before* the
+// destructive drain, so the node is never wiped onto a class its PVC could never bind to.
+func TestMigrationBlocksUnresolvableStorageClass(t *testing.T) {
+	cases := []struct {
+		name        string
+		targetClass string
+	}{
+		{"missing class", "ghost"},
+		{"empty class", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _, cluster, desired := migrationWorld(t, "1Gi", "1Gi", "1Gi", 2, 2, true)
+			cluster.Spec.NodePools[0].Storage.Data.StorageClass = ptr.To(tc.targetClass)
+			layout := seededLayout(2)
+			admin := &fakeClusterAdmin{layout: layout, health: health(healthStatusHealthy, 256)}
+			status := healthyStatus()
+
+			active, err := r.reconcileStorageMigration(context.Background(), cluster, status, admin, desired)
+			if err != nil {
+				t.Fatalf("reconcileStorageMigration: %v", err)
+			}
+			if !active {
+				t.Fatal("expected active=true so the generic layout path stays suppressed while blocked")
+			}
+			if _, in := layout.applied["node-0"]; !in {
+				t.Error("a blocked migration must not drain any node onto an unresolvable class")
+			}
+			if status.StorageMigration != nil {
+				t.Error("a blocked migration records no in-progress node")
+			}
+			cond := meta.FindStatusCondition(status.Conditions, conditionStorageChangePending)
+			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonBlocked {
+				t.Fatalf("expected StorageChangePending=False/Blocked, got %+v", cond)
+			}
+		})
+	}
+}
+
+// TestMigrationNoneNeededWhenClassPinsResolvedDefault proves the false-positive guard: pinning the
+// StorageClass field to the value the live PVC was already provisioned with is not drift, so no
+// migration starts.
+func TestMigrationNoneNeededWhenClassPinsResolvedDefault(t *testing.T) {
+	r, _, cluster, desired := migrationWorld(t, "1Gi", "1Gi", "1Gi", 2, 2, true)
+	// Set the field explicitly to the class the live PVCs already carry.
+	cluster.Spec.NodePools[0].Storage.Data.StorageClass = ptr.To(expandableStorageClass)
+	cluster.Spec.NodePools[0].Storage.Meta.StorageClass = ptr.To(expandableStorageClass)
+	layout := seededLayout(2)
+	admin := &fakeClusterAdmin{layout: layout, health: health(healthStatusHealthy, 256)}
+	status := healthyStatus()
+
+	active, err := r.reconcileStorageMigration(context.Background(), cluster, status, admin, desired)
+	if err != nil {
+		t.Fatalf("reconcileStorageMigration: %v", err)
+	}
+	if active {
+		t.Fatal("pinning the field to the resolved class is not drift; no migration should start")
+	}
+	if _, in := layout.applied["node-0"]; !in {
+		t.Error("no node should be drained when the class already matches")
+	}
+}
+
+// TestOrdinalVolumeStateTreatsClassMismatchAsOld proves the recreate phase does not declare a node
+// swapped while a PVC still carries the old StorageClass — even though the size is unchanged. Were
+// class ignored, a class-only migration would loop: the old PVC would read as swapped and its pod
+// would never be torn down to reprovision it on the new class.
+func TestOrdinalVolumeStateTreatsClassMismatchAsOld(t *testing.T) {
+	cluster := &garagev1alpha1.GarageCluster{ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testClusterNS}}
+	pool := &garagev1alpha1.NodePool{
+		Name:     testPoolName,
+		Replicas: 1,
+		Storage: garagev1alpha1.NodePoolStorage{
+			Data: garagev1alpha1.StorageSpec{Size: resource.MustParse("1Gi"), StorageClass: ptr.To("fast")},
+			Meta: garagev1alpha1.StorageSpec{Size: resource.MustParse("1Gi"), StorageClass: ptr.To("fast")},
+		},
+	}
+	classedClaim := func(volume, class string) *corev1.PersistentVolumeClaim {
+		pvc := storageClaim(ssName(), volume, 0, "1Gi")
+		pvc.Spec.StorageClassName = ptr.To(class)
+		return pvc
+	}
+
+	// Old data PVC still on "bulk" while the pool wants "fast": the node is not yet swapped.
+	rOld, _ := newStorageReconciler(t, classedClaim(volumeNameData, "bulk"), classedClaim(volumeNameMeta, "fast"))
+	got, err := rOld.ordinalVolumeState(context.Background(), cluster, pool, 0)
+	if err != nil {
+		t.Fatalf("ordinalVolumeState: %v", err)
+	}
+	if got != ordinalTearDown {
+		t.Errorf("ordinalVolumeState = %d, want ordinalTearDown (%d)", got, ordinalTearDown)
+	}
+
+	// Both PVCs now on "fast": the node is swapped and ready to rejoin.
+	rNew, _ := newStorageReconciler(t, classedClaim(volumeNameData, "fast"), classedClaim(volumeNameMeta, "fast"))
+	got, err = rNew.ordinalVolumeState(context.Background(), cluster, pool, 0)
+	if err != nil {
+		t.Fatalf("ordinalVolumeState: %v", err)
+	}
+	if got != ordinalSwapped {
+		t.Errorf("ordinalVolumeState = %d, want ordinalSwapped (%d)", got, ordinalSwapped)
+	}
+}
+
+// TestPvcClassMatches documents the explicit-only comparison semantics: a nil desired (cluster
+// default) or a classless live volume is never read as drift, and only an explicit class that
+// differs from a concrete live class is.
+func TestPvcClassMatches(t *testing.T) {
+	pvc := func(class *string) *corev1.PersistentVolumeClaim {
+		return &corev1.PersistentVolumeClaim{Spec: corev1.PersistentVolumeClaimSpec{StorageClassName: class}}
+	}
+	cases := []struct {
+		name    string
+		live    *string
+		desired *string
+		want    bool
+	}{
+		{"nil desired matches anything", ptr.To("fast"), nil, true},
+		{"equal classes match", ptr.To("fast"), ptr.To("fast"), true},
+		{"different classes do not match", ptr.To("fast"), ptr.To("bulk"), false},
+		{"classless live matches (no guess)", nil, ptr.To("fast"), true},
+		{"empty live class matches (no guess)", ptr.To(""), ptr.To("fast"), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pvcClassMatches(pvc(tc.live), tc.desired); got != tc.want {
+				t.Errorf("pvcClassMatches = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTemplateMatchesPoolDetectsClassChange proves the recreate phase notices a class-only change:
+// templateMatchesPool must report false when the live template requests a different StorageClass,
+// so the StatefulSet is orphan-recreated with the new class before any PVC is swapped.
+func TestTemplateMatchesPoolDetectsClassChange(t *testing.T) {
+	poolWith := func(dataClass *string) *garagev1alpha1.NodePool {
+		return &garagev1alpha1.NodePool{
+			Name:     testPoolName,
+			Replicas: 1,
+			Storage: garagev1alpha1.NodePoolStorage{
+				Data: garagev1alpha1.StorageSpec{Size: resource.MustParse("1Gi"), StorageClass: dataClass},
+				Meta: garagev1alpha1.StorageSpec{Size: resource.MustParse("1Gi")},
+			},
+		}
+	}
+	cluster := &garagev1alpha1.GarageCluster{ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testClusterNS}}
+
+	// Template provisions data on "bulk"; the pool now wants "fast".
+	ss := desiredStatefulSet(cluster, poolWith(ptr.To("bulk")))
+	if templateMatchesPool(ss, poolWith(ptr.To("fast"))) {
+		t.Error("expected a class change to make templateMatchesPool false")
+	}
+	if !templateMatchesPool(ss, poolWith(ptr.To("bulk"))) {
+		t.Error("expected an unchanged class to match")
+	}
+	// An omitted class is a nil template class and matches another omitted class.
+	ssNil := desiredStatefulSet(cluster, poolWith(nil))
+	if !templateMatchesPool(ssNil, poolWith(nil)) {
+		t.Error("expected two omitted classes to match")
+	}
+	if templateMatchesPool(ssNil, poolWith(ptr.To("fast"))) {
+		t.Error("expected omitted->explicit to be a change")
 	}
 }

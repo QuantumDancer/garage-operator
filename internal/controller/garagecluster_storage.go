@@ -39,6 +39,10 @@ import (
 // step (PLAN.md §4.5) owns this condition; reconcileStorage (the in-place path) never sets it.
 const conditionStorageChangePending = "StorageChangePending"
 
+// reasonBlocked is the condition reason shared by every guardrail that refuses a destructive
+// layout or storage change (replicationFactor, health, an unresolvable StorageClass).
+const reasonBlocked = "Blocked"
+
 // storageAction classifies how a volume's requested size change must be served.
 type storageAction int
 
@@ -48,8 +52,9 @@ const (
 	// storageGrowInPlace — the size increased on an expansion-capable StorageClass, so the
 	// existing PVCs can be patched larger (Path A, PLAN.md §5.4).
 	storageGrowInPlace
-	// storageMigrate — a shrink, or a grow the StorageClass cannot expand, so the volume must
-	// be recreated through the migration path (Path B, PLAN.md §4.5).
+	// storageMigrate — a shrink, a grow the StorageClass cannot expand, or a StorageClass change
+	// (whose immutable storageClassName forbids an in-place edit), so the volume must be recreated
+	// through the migration path (Path B, PLAN.md §4.5).
 	storageMigrate
 )
 
@@ -155,7 +160,7 @@ func (r *GarageClusterReconciler) planPoolStorage(ctx context.Context, cluster *
 	}
 	var grows []growth
 	for _, v := range volumes {
-		action, ok, classifyErr := r.classifyVolume(ctx, cluster.Namespace, ss, v.name, v.spec.Size)
+		action, ok, classifyErr := r.classifyVolume(ctx, cluster.Namespace, ss, v.name, v.spec)
 		if classifyErr != nil {
 			return false, false, classifyErr
 		}
@@ -182,19 +187,34 @@ func (r *GarageClusterReconciler) planPoolStorage(ctx context.Context, cluster *
 	return grew, false, nil
 }
 
-// classifyVolume decides how a single volume's size change is served by comparing the desired
-// size against what the live StatefulSet template provisions. A grow is served in place only
-// when the backing StorageClass allows expansion; a shrink, or a grow the class cannot expand,
-// must go through the migration path. The bool return is false when classification is not yet
-// possible (the claim is not provisioned), so the caller defers rather than acts.
-func (r *GarageClusterReconciler) classifyVolume(ctx context.Context, namespace string, ss *appsv1.StatefulSet, volume string, desired resource.Quantity) (storageAction, bool, error) {
+// classifyVolume decides how a single volume's change is served. A StorageClass change is checked
+// first: a PVC's storageClassName is immutable, so an explicitly-requested class that differs from
+// what the live volume was provisioned with always routes to migration, whatever the size does.
+// Otherwise the desired size is compared against what the live StatefulSet template provisions: a
+// grow is served in place only when the backing StorageClass allows expansion; a shrink, or a grow
+// the class cannot expand, goes through the migration path. The bool return is false when
+// classification is not yet possible (the claim is not provisioned), so the caller defers.
+func (r *GarageClusterReconciler) classifyVolume(ctx context.Context, namespace string, ss *appsv1.StatefulSet, volume string, spec garagev1alpha1.StorageSpec) (storageAction, bool, error) {
+	drifted, ok, err := r.classMigrationNeeded(ctx, namespace, ss.Name, volume, spec.StorageClass)
+	if err != nil {
+		return storageNoChange, false, err
+	}
+	if !ok {
+		// An explicit class was requested but the ordinal-0 PVC is not provisioned yet, so the live
+		// class is unknown. Defer rather than guess.
+		return storageNoChange, false, nil
+	}
+	if drifted {
+		return storageMigrate, true, nil
+	}
+
 	current, ok := templateStorageRequest(ss, volume)
 	if !ok {
 		// The template should always carry both claims; if not, the StatefulSet predates this
 		// operator's invariants — leave it alone rather than guess.
 		return storageNoChange, true, nil
 	}
-	switch desired.Cmp(current) {
+	switch spec.Size.Cmp(current) {
 	case 0:
 		return storageNoChange, true, nil
 	case -1:
@@ -217,19 +237,70 @@ func (r *GarageClusterReconciler) classifyVolume(ctx context.Context, namespace 
 	return storageMigrate, true, nil
 }
 
+// classMigrationNeeded reports whether the volume's explicitly-requested StorageClass differs
+// from the class its live ordinal-0 PVC was provisioned with — a change a StatefulSet's immutable
+// volumeClaimTemplates can only serve by recreating the volume through the migration path. The
+// bool ok is false only when an explicit class is requested but the ordinal-0 PVC is not yet
+// provisioned (so the live class is unknown); the caller should defer. A nil desired (the cluster
+// default) never drifts and is always comparable: the operator deliberately does not diff a moving
+// default (PLAN.md §4.5), so removing the storageClass field is a no-op until another change drives
+// a migration.
+func (r *GarageClusterReconciler) classMigrationNeeded(ctx context.Context, namespace, statefulSet, volume string, desired *string) (drifted bool, ok bool, err error) {
+	if desired == nil {
+		return false, true, nil
+	}
+	pvc, err := r.claim(ctx, namespace, statefulSet, volume, 0)
+	if err != nil {
+		return false, false, err
+	}
+	if pvc == nil {
+		return false, false, nil
+	}
+	return !pvcClassMatches(pvc, desired), true, nil
+}
+
+// pvcClassMatches reports whether a live PVC already carries the explicitly-requested StorageClass.
+// A nil desired (the cluster default) matches unconditionally, and an indeterminate live class ("",
+// a classless volume) is treated as a match — the operator never migrates a classless volume on a
+// guess. The live class is the class the API server resolved at provisioning time (it records the
+// resolved default on the PVC), so pinning the field to the value that was already the default does
+// not read as drift.
+func pvcClassMatches(pvc *corev1.PersistentVolumeClaim, desired *string) bool {
+	if desired == nil {
+		return true
+	}
+	live := ""
+	if pvc.Spec.StorageClassName != nil {
+		live = *pvc.Spec.StorageClassName
+	}
+	if live == "" {
+		return true
+	}
+	return live == *desired
+}
+
+// templateClaim returns the StatefulSet's volumeClaimTemplate for the named volume, or nil when the
+// template has no such claim. It is the single find-by-name traversal the size and class readers
+// (templateStorageRequest, templateStorageClass) share.
+func templateClaim(ss *appsv1.StatefulSet, volume string) *corev1.PersistentVolumeClaim {
+	for i := range ss.Spec.VolumeClaimTemplates {
+		if ss.Spec.VolumeClaimTemplates[i].Name == volume {
+			return &ss.Spec.VolumeClaimTemplates[i]
+		}
+	}
+	return nil
+}
+
 // templateStorageRequest returns the storage request the StatefulSet's volumeClaimTemplate for
 // the named volume currently asks for. The second return is false when the template has no such
 // claim or no storage request.
 func templateStorageRequest(ss *appsv1.StatefulSet, volume string) (resource.Quantity, bool) {
-	for i := range ss.Spec.VolumeClaimTemplates {
-		vct := &ss.Spec.VolumeClaimTemplates[i]
-		if vct.Name != volume {
-			continue
-		}
-		q, ok := vct.Spec.Resources.Requests[corev1.ResourceStorage]
-		return q, ok
+	vct := templateClaim(ss, volume)
+	if vct == nil {
+		return resource.Quantity{}, false
 	}
-	return resource.Quantity{}, false
+	q, ok := vct.Spec.Resources.Requests[corev1.ResourceStorage]
+	return q, ok
 }
 
 // storageClassExpandable reports whether the StorageClass backing a volume's PVCs permits

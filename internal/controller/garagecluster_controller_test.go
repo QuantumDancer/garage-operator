@@ -714,7 +714,7 @@ var _ = Describe("GarageCluster destructive layout (rf=1 blocked)", Ordered, fun
 		cond := meta.FindStatusCondition(cluster.Status.Conditions, conditionLayoutChangePending)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-		Expect(cond.Reason).To(Equal("Blocked"))
+		Expect(cond.Reason).To(Equal(reasonBlocked))
 	})
 })
 

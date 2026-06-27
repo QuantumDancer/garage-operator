@@ -146,7 +146,7 @@ func (r *GarageClusterReconciler) reconcileDestructiveLayout(ctx context.Context
 // status.Layout is left untouched: the live layout still holds every node, so the carried-over
 // last-applied layout remains the accurate report.
 func (r *GarageClusterReconciler) blockLayoutChange(ctx context.Context, cluster *garagev1alpha1.GarageCluster, status *garagev1alpha1.GarageClusterStatus, layoutClient clusterAdmin, msg string) {
-	setCondition(status, conditionLayoutChangePending, metav1.ConditionFalse, "Blocked", msg)
+	setCondition(status, conditionLayoutChangePending, metav1.ConditionFalse, reasonBlocked, msg)
 	r.eventf(cluster, corev1.EventTypeWarning, "LayoutChangeBlocked", msg)
 	_ = layoutClient.RevertStagedChanges(ctx)
 }
