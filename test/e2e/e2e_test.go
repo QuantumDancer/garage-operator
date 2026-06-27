@@ -154,7 +154,13 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 	SetDefaultEventuallyPollingInterval(time.Second)
 
 	Context("Manager", func() {
-		It("should run successfully", func() {
+		// Each spec carries a Ginkgo Label so CI can shard the suite across parallel
+		// jobs (one Kind cluster per job) via `-ginkgo.label-filter`, and so a local
+		// run can focus only the specs covering the code under change. The label↔shard
+		// mapping lives in .github/workflows/test-e2e.yml. The manager and metrics
+		// specs share the "manager" label deliberately: the metrics spec reuses the
+		// controllerPodName the manager spec discovers, so they must run together.
+		It("should run successfully", Label("manager"), func() {
 			By("validating that the controller-manager pod is running as expected")
 			verifyControllerUp := func(g Gomega) {
 				By("getting the name of the controller-manager pod")
@@ -190,7 +196,7 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 		// (the metrics probe itself hits the Service ClusterIP, so it does not depend on in-pod
 		// DNS). The spec is idempotent across retries: the ClusterRoleBinding and curl pod are
 		// both create-or-replace.
-		It("should ensure the metrics endpoint is serving metrics", FlakeAttempts(2), func() {
+		It("should ensure the metrics endpoint is serving metrics", Label("manager"), FlakeAttempts(2), func() {
 			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
 			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
 				"--clusterrole=garage-operator-metrics-reader",
@@ -313,7 +319,7 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
 		})
 
-		It("should bring up a 3-node GarageCluster with the layout applied", func() {
+		It("should bring up a 3-node GarageCluster with the layout applied", Label("cluster"), func() {
 			const clusterNamespace = "garage-e2e"
 			const clusterName = "e2e"
 
@@ -385,7 +391,7 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
 		})
 
-		It("should gate a node drain behind approval, then reclaim the node's PVCs", func() {
+		It("should gate a node drain behind approval, then reclaim the node's PVCs", Label("drain"), func() {
 			const clusterNamespace = "garage-drain-e2e"
 			const clusterName = "drain"
 			const ssName = "drain-default"
@@ -509,7 +515,7 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
 		})
 
-		It("should grow a node's storage in place when its data size is increased", func() {
+		It("should grow a node's storage in place when its data size is increased", Label("grow"), func() {
 			const clusterNamespace = "garage-grow-e2e"
 			const clusterName = "grow"
 			const ssName = "grow-default"
@@ -630,7 +636,7 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", scFile))
 		})
 
-		It("should migrate a node's storage when its data size is shrunk", func() {
+		It("should migrate a node's storage when its data size is shrunk", Label("shrink"), func() {
 			const clusterNamespace = "garage-shrink-e2e"
 			const clusterName = "shrink"
 			const ssName = "shrink-default"
@@ -736,7 +742,7 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
 		})
 
-		It("should migrate a node's storage when its data StorageClass is changed", func() {
+		It("should migrate a node's storage when its data StorageClass is changed", Label("class"), func() {
 			const clusterNamespace = "garage-class-e2e"
 			const clusterName = "class"
 			const ssName = "class-default"
@@ -870,7 +876,7 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", scFile))
 		})
 
-		It("should take a metadata snapshot and launch a repair when annotated", func() {
+		It("should take a metadata snapshot and launch a repair when annotated", Label("maintenance"), func() {
 			const clusterNamespace = "garage-maint-e2e"
 			const clusterName = "maint"
 
@@ -947,7 +953,7 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
 		})
 
-		It("should provision a GarageBucket against a single-node cluster", func() {
+		It("should provision a GarageBucket against a single-node cluster", Label("bucket"), func() {
 			const bucketNamespace = "garage-bucket-e2e"
 			const clusterName = "bkt"
 			const bucketName = "photos"
@@ -1053,7 +1059,7 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", bucketNamespace))
 		})
 
-		It("should provision a GarageKey and grant it on a bucket with a local alias", func() {
+		It("should provision a GarageKey and grant it on a bucket with a local alias", Label("key"), func() {
 			const ns = "garage-key-e2e"
 			const clusterName = "keys"
 			const keyName = "appkey"
