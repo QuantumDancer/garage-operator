@@ -221,7 +221,7 @@ func (r *GarageClusterReconciler) deleteClaims(ctx context.Context, namespace, s
 		for _, volume := range []string{volumeNameMeta, volumeNameData} {
 			pvc := &corev1.PersistentVolumeClaim{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      fmt.Sprintf("%s-%s-%d", volume, statefulSet, ordinal),
+					Name:      claimName(volume, statefulSet, ordinal),
 					Namespace: namespace,
 				},
 			}

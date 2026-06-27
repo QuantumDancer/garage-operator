@@ -102,7 +102,8 @@ func defaultAdminClientFactory(baseURL, token string) (clusterAdmin, error) {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services;configmaps;secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 // Reconcile drives the observed cluster toward the GarageCluster spec: it provisions the
@@ -132,6 +133,18 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if err := r.ensureWorkload(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// In-place storage growth runs after the workload exists but before the readiness gate: a
+	// grow orphan-deletes the StatefulSet so it can be recreated with the larger volume
+	// template, and requeuing here lets ensureWorkload recreate it cleanly on the next pass
+	// rather than racing the deletion.
+	recreate, err := r.reconcileStorage(ctx, &cluster, status)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if recreate {
+		return r.finish(ctx, &cluster, status, ctrl.Result{RequeueAfter: workloadRequeue})
 	}
 
 	ready, err := r.workloadReady(ctx, &cluster)

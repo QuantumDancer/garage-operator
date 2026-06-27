@@ -509,6 +509,127 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
 		})
 
+		It("should grow a node's storage in place when its data size is increased", func() {
+			const clusterNamespace = "garage-grow-e2e"
+			const clusterName = "grow"
+			const ssName = "grow-default"
+			const storageClassName = "garage-expandable"
+
+			By("preloading the Garage image into the Kind cluster")
+			_, err := utils.Run(exec.Command("docker", "pull", garageImage))
+			Expect(err).NotTo(HaveOccurred(), "Failed to pull the Garage image")
+			Expect(utils.LoadImageToKindClusterWithName(garageImage)).To(Succeed(), "Failed to load Garage image into Kind")
+
+			By("creating the grow-test namespace")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", clusterNamespace))
+
+			// kind's default StorageClass does not allow volume expansion, so define one backed by
+			// the same local-path provisioner that does. local-path accepts the resize request at
+			// the API level (it does not enforce volume size), which is all the operator's
+			// in-place-growth contract needs: the physical filesystem resize is the CSI's job.
+			By("creating an expansion-capable StorageClass")
+			scManifest := fmt.Sprintf(`apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: %s
+provisioner: rancher.io/local-path
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+`, storageClassName)
+			scFile := filepath.Join("/tmp", "garage-expandable-sc.yaml")
+			Expect(os.WriteFile(scFile, []byte(scManifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", scFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply StorageClass")
+
+			By("applying a single-node GarageCluster on the expandable StorageClass")
+			manifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicationFactor: 1
+  nodePools:
+    - name: default
+      replicas: 1
+      storage:
+        data: { size: 1Gi, storageClass: %s }
+        meta: { size: 1Gi, storageClass: %s }
+`, clusterName, clusterNamespace, storageClassName, storageClassName)
+			manifestFile := filepath.Join("/tmp", "garagecluster-grow-e2e.yaml")
+			Expect(os.WriteFile(manifestFile, []byte(manifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", manifestFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
+
+			getStatus := func(jsonPath string) (string, error) {
+				return utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", clusterNamespace, "-o", "jsonpath="+jsonPath))
+			}
+
+			By("waiting for the single-node cluster to become Ready at 1Gi")
+			Eventually(func(g Gomega) {
+				ready, err := getStatus("{.status.conditions[?(@.type=='Ready')].status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "GarageCluster is not Ready")
+				capacity, err := getStatus("{.status.layout.nodes[0].capacity}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(capacity).To(Equal("1Gi"), "initial layout capacity should be 1Gi")
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("recording the original pod name to prove it is not restarted by the resize")
+			podName, err := utils.Run(exec.Command("kubectl", "get", "pod", ssName+"-0",
+				"-n", clusterNamespace, "-o", "jsonpath={.metadata.uid}"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(podName).NotTo(BeEmpty())
+
+			By("increasing the data volume size to 2Gi")
+			_, err = utils.Run(exec.Command("kubectl", "patch", "garagecluster", clusterName,
+				"-n", clusterNamespace, "--type=json",
+				"-p", `[{"op":"replace","path":"/spec/nodePools/0/storage/data/size","value":"2Gi"}]`))
+			Expect(err).NotTo(HaveOccurred(), "Failed to patch data size")
+
+			By("expanding the data PVC and recreating the StatefulSet with the larger template")
+			Eventually(func(g Gomega) {
+				pvcSize, err := utils.Run(exec.Command("kubectl", "get", "pvc",
+					"data-"+ssName+"-0", "-n", clusterNamespace,
+					"-o", "jsonpath={.spec.resources.requests.storage}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(pvcSize).To(Equal("2Gi"), "data PVC request should be grown to 2Gi")
+
+				vctSize, err := utils.Run(exec.Command("kubectl", "get", "statefulset", ssName,
+					"-n", clusterNamespace,
+					"-o", "jsonpath={.spec.volumeClaimTemplates[?(@.metadata.name=='data')].spec.resources.requests.storage}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(vctSize).To(Equal("2Gi"), "StatefulSet data template should be recreated at 2Gi")
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("re-applying the derived capacity to the layout while staying Ready and healthy")
+			Eventually(func(g Gomega) {
+				ready, err := getStatus("{.status.conditions[?(@.type=='Ready')].status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "cluster should remain Ready after the resize")
+
+				capacity, err := getStatus("{.status.layout.nodes[0].capacity}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(capacity).To(Equal("2Gi"), "layout capacity should reflect the grown data size")
+
+				health, err := getStatus("{.status.health.status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(health).To(Equal("healthy"), "cluster should stay healthy")
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("confirming the Garage pod was not restarted by the in-place resize")
+			uidAfter, err := utils.Run(exec.Command("kubectl", "get", "pod", ssName+"-0",
+				"-n", clusterNamespace, "-o", "jsonpath={.metadata.uid}"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(uidAfter).To(Equal(podName), "the pod should be re-adopted, not recreated")
+
+			By("cleaning up the GarageCluster and StorageClass")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", scFile))
+		})
+
 		It("should provision a GarageBucket against a single-node cluster", func() {
 			const bucketNamespace = "garage-bucket-e2e"
 			const clusterName = "bkt"
