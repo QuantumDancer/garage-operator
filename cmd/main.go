@@ -179,9 +179,12 @@ func main() {
 	}
 
 	if err := (&controller.GarageClusterReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("garagecluster-controller"),
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		// GetEventRecorderFor is deprecated in favour of the new events API, but the
+		// reconcilers (and their test fakes) use the classic record.EventRecorder it
+		// returns. controller-runtime itself nolints the same call; migrate together.
+		Recorder: mgr.GetEventRecorderFor("garagecluster-controller"), //nolint:staticcheck
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "garagecluster")
 		os.Exit(1)
@@ -189,7 +192,7 @@ func main() {
 	if err := (&controller.GarageBucketReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("garagebucket-controller"),
+		Recorder: mgr.GetEventRecorderFor("garagebucket-controller"), //nolint:staticcheck
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "garagebucket")
 		os.Exit(1)
