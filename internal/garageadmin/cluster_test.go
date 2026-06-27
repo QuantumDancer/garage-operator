@@ -510,6 +510,119 @@ func TestAddNodeAssignsOneRole(t *testing.T) {
 	}
 }
 
+func zoneRedundancyMaximumUnion(t *testing.T) ZoneRedundancy {
+	t.Helper()
+	var zr ZoneRedundancy
+	if err := zr.FromZoneRedundancy1(Maximum); err != nil {
+		t.Fatalf("build maximum: %v", err)
+	}
+	return zr
+}
+
+func zoneRedundancyAtLeastUnion(t *testing.T, n int) ZoneRedundancy {
+	t.Helper()
+	var zr ZoneRedundancy
+	if err := zr.FromZoneRedundancy0(ZoneRedundancy0{AtLeast: n}); err != nil {
+		t.Fatalf("build atLeast: %v", err)
+	}
+	return zr
+}
+
+func TestCurrentZoneRedundancyMaximum(t *testing.T) {
+	fake := &fakeAdmin{
+		t:      t,
+		layout: GetClusterLayoutResponse{Version: 1, Parameters: LayoutParameters{ZoneRedundancy: zoneRedundancyMaximumUnion(t)}},
+	}
+	client := newTestClient(t, fake)
+
+	got, err := client.CurrentZoneRedundancy(context.Background())
+	if err != nil {
+		t.Fatalf("CurrentZoneRedundancy: %v", err)
+	}
+	if !got.Maximum {
+		t.Errorf("got %+v, want Maximum", got)
+	}
+}
+
+func TestCurrentZoneRedundancyAtLeast(t *testing.T) {
+	fake := &fakeAdmin{
+		t:      t,
+		layout: GetClusterLayoutResponse{Version: 1, Parameters: LayoutParameters{ZoneRedundancy: zoneRedundancyAtLeastUnion(t, 2)}},
+	}
+	client := newTestClient(t, fake)
+
+	got, err := client.CurrentZoneRedundancy(context.Background())
+	if err != nil {
+		t.Fatalf("CurrentZoneRedundancy: %v", err)
+	}
+	if got.Maximum || got.AtLeast != 2 {
+		t.Errorf("got %+v, want AtLeast 2", got)
+	}
+}
+
+func TestSetZoneRedundancyStagesParametersAndApplies(t *testing.T) {
+	fake := &fakeAdmin{
+		t:      t,
+		layout: GetClusterLayoutResponse{Version: 4, Parameters: LayoutParameters{ZoneRedundancy: zoneRedundancyMaximumUnion(t)}},
+	}
+	client := newTestClient(t, fake)
+
+	version, err := client.SetZoneRedundancy(context.Background(), ZoneRedundancyValue{AtLeast: 2})
+	if err != nil {
+		t.Fatalf("SetZoneRedundancy: %v", err)
+	}
+	if version != 5 {
+		t.Errorf("version = %d, want 5 (current+1)", version)
+	}
+	// Leftover staged changes are discarded first, then exactly the parameters are staged and
+	// applied as the next version.
+	if fake.revertCalls != 1 || fake.updateCalls != 1 || fake.applyCalls != 1 {
+		t.Fatalf("revert/update/apply = %d/%d/%d, want 1/1/1", fake.revertCalls, fake.updateCalls, fake.applyCalls)
+	}
+	if got := fake.appliedVersions[0]; got != 5 {
+		t.Errorf("applied version = %d, want 5", got)
+	}
+
+	body := fake.updateBodies[0]
+	if body.Roles != nil {
+		t.Errorf("roles = %v, want nil for a parameters-only update", body.Roles)
+	}
+	if body.Parameters == nil {
+		t.Fatal("parameters = nil, want the staged zone redundancy")
+	}
+	lp, err := body.Parameters.AsLayoutParameters()
+	if err != nil {
+		t.Fatalf("decode staged parameters: %v", err)
+	}
+	val, err := zoneRedundancyFromAPI(lp.ZoneRedundancy)
+	if err != nil {
+		t.Fatalf("decode staged redundancy: %v", err)
+	}
+	if val.Maximum || val.AtLeast != 2 {
+		t.Errorf("staged redundancy = %+v, want AtLeast 2", val)
+	}
+}
+
+func TestZoneRedundancyValueEqual(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b ZoneRedundancyValue
+		want bool
+	}{
+		{"both maximum", ZoneRedundancyValue{Maximum: true}, ZoneRedundancyValue{Maximum: true}, true},
+		{"maximum vs atLeast", ZoneRedundancyValue{Maximum: true}, ZoneRedundancyValue{AtLeast: 2}, false},
+		{"same atLeast", ZoneRedundancyValue{AtLeast: 3}, ZoneRedundancyValue{AtLeast: 3}, true},
+		{"different atLeast", ZoneRedundancyValue{AtLeast: 2}, ZoneRedundancyValue{AtLeast: 3}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.a.Equal(tc.b); got != tc.want {
+				t.Errorf("%+v.Equal(%+v) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestEnsureLayoutRestagesOnCapacityChange(t *testing.T) {
 	fake := &fakeAdmin{
 		t: t,

@@ -381,10 +381,11 @@ func desiredStatefulSet(c *garagev1alpha1.GarageCluster, pool *garagev1alpha1.No
 						FSGroup:        ptr.To(int64(1000)),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Containers:   []corev1.Container{container},
-					NodeSelector: pool.NodeSelector,
-					Tolerations:  pool.Tolerations,
-					Affinity:     pool.Affinity,
+					Containers:                []corev1.Container{container},
+					NodeSelector:              pool.NodeSelector,
+					Tolerations:               pool.Tolerations,
+					Affinity:                  pool.Affinity,
+					TopologySpreadConstraints: topologySpreadConstraints(c, pool),
 					Volumes: []corev1.Volume{
 						{
 							Name: "config",
@@ -403,6 +404,23 @@ func desiredStatefulSet(c *garagev1alpha1.GarageCluster, pool *garagev1alpha1.No
 			},
 		},
 	}
+}
+
+// topologySpreadConstraints injects a default zone spread when a pool derives its zone from a
+// Node label (zoneFrom): it is what makes a single pool's replicas actually land in distinct
+// zones, so the per-pod zone derivation has different values to read. maxSkew 1 with
+// DoNotSchedule keeps the pool balanced across the label's values. The user owns scheduling
+// via the affinity field, so a pool that sets its own affinity opts out of the default.
+func topologySpreadConstraints(c *garagev1alpha1.GarageCluster, pool *garagev1alpha1.NodePool) []corev1.TopologySpreadConstraint {
+	if pool.ZoneFrom == "" || pool.Affinity != nil {
+		return nil
+	}
+	return []corev1.TopologySpreadConstraint{{
+		MaxSkew:           1,
+		TopologyKey:       pool.ZoneFrom,
+		WhenUnsatisfiable: corev1.DoNotSchedule,
+		LabelSelector:     &metav1.LabelSelector{MatchLabels: poolSelectorLabels(c, pool.Name)},
+	}}
 }
 
 func secretEnvSource(ref secretRef) *corev1.EnvVarSource {

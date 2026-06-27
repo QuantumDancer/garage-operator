@@ -469,3 +469,105 @@ var _ = Describe("GarageCluster storage migration integration", Ordered, func() 
 		Expect(layout.applied).To(HaveKey(node0), "the recreated node rejoins the layout")
 	})
 })
+
+// This envtest spec proves the multi-zone path (PLAN.md Phase 5) is wired into Reconcile
+// against a real API server: a two-pool cluster lays out each pool as its own zone, and the
+// spec's zoneRedundancy parameter is converged onto the layout. envtest runs no StatefulSet
+// controller, so the spec marks each pool's StatefulSet ready by hand. The per-pod admin client
+// derives a distinct node id from its base URL so the two pools form a two-node, two-zone layout.
+var _ = Describe("GarageCluster multi-zone integration", Ordered, func() {
+	const (
+		itNamespace = "garage-cluster-multizone-it"
+		clusterName = "zonecluster"
+	)
+
+	layout := newFakeLayout()
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), layout: layout}, nil
+			},
+			Recorder: record.NewFakeRecorder(100),
+		}
+	}
+
+	clusterKey := client.ObjectKey{Name: clusterName, Namespace: itNamespace}
+
+	// twoPoolSpec mirrors what the API server stores after defaulting: two single-node pools,
+	// each pinned to its own static zone, with a cross-zone replication request of atLeast 2.
+	twoPoolSpec := func() garagev1alpha1.GarageClusterSpec {
+		spec := newBasicClusterSpec(2, 1)
+		spec.NodePools = []garagev1alpha1.NodePool{
+			{
+				Name: "a", Replicas: 1, Zone: "zone-a",
+				Storage: garagev1alpha1.NodePoolStorage{
+					Data: garagev1alpha1.StorageSpec{Size: resource.MustParse("1Gi")},
+					Meta: garagev1alpha1.StorageSpec{Size: resource.MustParse("1Gi")},
+				},
+			},
+			{
+				Name: "b", Replicas: 1, Zone: "zone-b",
+				Storage: garagev1alpha1.NodePoolStorage{
+					Data: garagev1alpha1.StorageSpec{Size: resource.MustParse("1Gi")},
+					Meta: garagev1alpha1.StorageSpec{Size: resource.MustParse("1Gi")},
+				},
+			},
+		}
+		spec.ZoneRedundancy = &garagev1alpha1.ZoneRedundancy{Mode: garagev1alpha1.ZoneRedundancyAtLeast, AtLeast: 2}
+		return spec
+	}
+
+	markPoolReady := func(pool string) {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: clusterName + "-" + pool, Namespace: itNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = *ss.Spec.Replicas
+		ss.Status.ReadyReplicas = *ss.Spec.Replicas
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: itNamespace}})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: itNamespace},
+			Spec:       twoPoolSpec(),
+		})).To(Succeed())
+	})
+
+	AfterAll(func() {
+		cluster := &garagev1alpha1.GarageCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: itNamespace}}
+		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, cluster))).To(Succeed())
+	})
+
+	It("lays out each pool as its own zone and converges zoneRedundancy", func() {
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("marking both pools' StatefulSets ready (envtest has no kubelet)")
+		markPoolReady("a")
+		markPoolReady("b")
+
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("reporting both nodes in the layout, one per zone")
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, clusterKey, &cluster)).To(Succeed())
+		Expect(cluster.Status.Layout).NotTo(BeNil())
+		zones := map[string]struct{}{}
+		for _, n := range cluster.Status.Layout.Nodes {
+			zones[n.Zone] = struct{}{}
+		}
+		Expect(zones).To(HaveKey("zone-a"))
+		Expect(zones).To(HaveKey("zone-b"))
+
+		By("applying the requested zone redundancy onto the layout")
+		Expect(layout.redundancy.Maximum).To(BeFalse())
+		Expect(layout.redundancy.AtLeast).To(Equal(2))
+
+		By("reaching Ready")
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady)).To(BeTrue())
+	})
+})

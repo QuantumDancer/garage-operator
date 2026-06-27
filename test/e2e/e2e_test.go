@@ -515,6 +515,103 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
 		})
 
+		It("should lay out a multi-zone cluster (static + zoneFrom) and apply zoneRedundancy", Label("multizone"), func() {
+			const clusterNamespace = "garage-zone-e2e"
+			const clusterName = "zone"
+			// A custom Node label pool "b" derives its zone from via zoneFrom. The e2e Kind
+			// cluster is single-node, so both pools land on the same Node; the static zone on
+			// pool "a" and the derived zone on pool "b" still give the layout two distinct
+			// zones, which is what cross-zone replication needs.
+			const zoneNodeLabel = "garage.rottler.io/e2e-zone"
+
+			By("preloading the Garage image into the Kind cluster")
+			_, err := utils.Run(exec.Command("docker", "pull", garageImage))
+			Expect(err).NotTo(HaveOccurred(), "Failed to pull the Garage image")
+			Expect(utils.LoadImageToKindClusterWithName(garageImage)).To(Succeed(), "Failed to load Garage image into Kind")
+
+			By("labelling the Node so the zoneFrom pool can derive its zone")
+			_, err = utils.Run(exec.Command("kubectl", "label", "nodes", "--all",
+				zoneNodeLabel+"=zone-b", "--overwrite"))
+			Expect(err).NotTo(HaveOccurred(), "Failed to label nodes for zoneFrom")
+
+			By("creating the cluster namespace")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", clusterNamespace))
+
+			// Two single-node pools at replicationFactor 2: pool "a" pins its zone statically,
+			// pool "b" derives it from the Node label. zoneRedundancy atLeast 2 then requires
+			// every partition to span both zones — the cross-zone replication this exercises.
+			By("applying a two-pool, two-zone GarageCluster with zoneRedundancy atLeast 2")
+			manifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicationFactor: 2
+  zoneRedundancy:
+    mode: AtLeast
+    atLeast: 2
+  nodePools:
+    - name: a
+      replicas: 1
+      zone: zone-a
+      storage:
+        data: { size: 1Gi }
+        meta: { size: 1Gi }
+    - name: b
+      replicas: 1
+      zoneFrom: %s
+      storage:
+        data: { size: 1Gi }
+        meta: { size: 1Gi }
+`, clusterName, clusterNamespace, zoneNodeLabel)
+			manifestFile := filepath.Join("/tmp", "garagecluster-zone-e2e.yaml")
+			Expect(os.WriteFile(manifestFile, []byte(manifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", manifestFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
+
+			getStatus := func(jsonPath string) (string, error) {
+				return utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", clusterNamespace, "-o", "jsonpath="+jsonPath))
+			}
+
+			By("waiting for Ready with both nodes in the layout, one per zone, and healthy")
+			verifyZoned := func(g Gomega) {
+				ready, err := getStatus("{.status.conditions[?(@.type=='Ready')].status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "GarageCluster is not Ready")
+
+				health, err := getStatus("{.status.health.status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(health).To(Equal("healthy"), "cluster health is not healthy")
+
+				nodes, err := getStatus("{.status.layout.nodes[*].nodeId}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(utils.GetNonEmptyLines(strings.ReplaceAll(nodes, " ", "\n"))).
+					To(HaveLen(2), "both nodes should be in the layout")
+
+				zones, err := getStatus("{.status.layout.nodes[*].zone}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(zones).To(ContainSubstring("zone-a"), "pool a should be laid out in its static zone")
+				g.Expect(zones).To(ContainSubstring("zone-b"), "pool b should derive its zone from the Node label")
+			}
+			Eventually(verifyZoned, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("confirming Garage accepted the atLeast-2 zone redundancy and keeps LayoutApplied")
+			// A too-high atLeast would leave LayoutApplied=False/ZoneRedundancyInvalid; with two
+			// zones present the change applies cleanly, so LayoutApplied stays True.
+			Consistently(func(g Gomega) {
+				applied, err := getStatus("{.status.conditions[?(@.type=='LayoutApplied')].status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(applied).To(Equal("True"), "zone redundancy should apply cleanly with two zones")
+			}, 15*time.Second, 5*time.Second).Should(Succeed())
+
+			By("cleaning up the GarageCluster and the Node label")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
+			_, _ = utils.Run(exec.Command("kubectl", "label", "nodes", "--all", zoneNodeLabel+"-"))
+		})
+
 		It("should grow a node's storage in place when its data size is increased", Label("grow"), func() {
 			const clusterNamespace = "garage-grow-e2e"
 			const clusterName = "grow"
