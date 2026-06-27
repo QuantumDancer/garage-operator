@@ -351,10 +351,7 @@ func (r *GarageClusterReconciler) workloadReady(ctx context.Context, cluster *ga
 			}
 			return false, err
 		}
-		want := int32(0)
-		if ss.Spec.Replicas != nil {
-			want = *ss.Spec.Replicas
-		}
+		want := replicaCount(&ss)
 		if ss.Status.ObservedGeneration != ss.Generation || ss.Status.ReadyReplicas != want {
 			return false, nil
 		}

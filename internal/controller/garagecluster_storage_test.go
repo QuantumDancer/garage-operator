@@ -249,6 +249,57 @@ func TestReconcileStorageNoopWhenSizesMatch(t *testing.T) {
 	}
 }
 
+// TestReconcileStorageDefersGrowWhileScaleDownPending guards the dangerous interaction where a
+// grow coincides with a not-yet-drained scale-down: orphan-recreating the StatefulSet would
+// bring it back at the reduced replica count, deleting undrained nodes and bypassing the gated
+// drain. The grow must defer until the live and desired replica counts agree.
+func TestReconcileStorageDefersGrowWhileScaleDownPending(t *testing.T) {
+	// Live StatefulSet runs 3 replicas; the user grows data and scales the pool down to 2.
+	fx := newStorageFixture("1Gi", "2Gi", "1Gi", 3, true)
+	fx.cluster.Spec.NodePools[0].Replicas = 2
+	r, c := newStorageReconciler(t, fx.objs...)
+
+	recreate, err := r.reconcileStorage(context.Background(), fx.cluster, &garagev1alpha1.GarageClusterStatus{})
+	if err != nil {
+		t.Fatalf("reconcileStorage: %v", err)
+	}
+	if recreate {
+		t.Fatal("expected recreate=false: the grow must defer to the gated drain")
+	}
+
+	var ss appsv1.StatefulSet
+	if err := c.Get(context.Background(), types.NamespacedName{Name: ssName(), Namespace: testClusterNS}, &ss); err != nil {
+		t.Fatalf("StatefulSet must not be orphan-deleted: %v", err)
+	}
+	if got := claimSize(t, c, ssName(), volumeNameData, 0); got.Cmp(resource.MustParse("1Gi")) != 0 {
+		t.Errorf("data claim = %s, want 1Gi: PVCs must not grow while a scale-down is pending", got.String())
+	}
+}
+
+// TestReconcileStorageSkipsTerminatingStatefulSet covers the requeue window after an orphan
+// delete: while the old StatefulSet lingers in Terminating (awaiting GC), the grow must not be
+// re-issued, so the delete and StorageExpanded event fire only once.
+func TestReconcileStorageSkipsTerminatingStatefulSet(t *testing.T) {
+	fx := newStorageFixture("1Gi", "2Gi", "1Gi", 1, true)
+	ss := fx.objs[0].(*appsv1.StatefulSet)
+	now := metav1.Now()
+	ss.DeletionTimestamp = &now
+	// The fake client requires a finalizer on an object carrying a deletionTimestamp.
+	ss.Finalizers = []string{"kubernetes.io/orphan"}
+	r, c := newStorageReconciler(t, fx.objs...)
+
+	recreate, err := r.reconcileStorage(context.Background(), fx.cluster, &garagev1alpha1.GarageClusterStatus{})
+	if err != nil {
+		t.Fatalf("reconcileStorage: %v", err)
+	}
+	if recreate {
+		t.Fatal("expected recreate=false for a StatefulSet already being deleted")
+	}
+	if got := claimSize(t, c, ssName(), volumeNameData, 0); got.Cmp(resource.MustParse("1Gi")) != 0 {
+		t.Errorf("data claim = %s, want 1Gi: a terminating StatefulSet must not be re-grown", got.String())
+	}
+}
+
 // TestReconcileStorageNoStatefulSetYet covers a freshly-created cluster whose StatefulSet has
 // not been provisioned: there is nothing to grow and the call is a no-op.
 func TestReconcileStorageNoStatefulSetYet(t *testing.T) {

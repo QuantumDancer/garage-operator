@@ -72,6 +72,25 @@ func (r *GarageClusterReconciler) reconcileStorage(ctx context.Context, cluster 
 			return false, getErr
 		}
 
+		// Already orphan-deleted on a prior pass and not yet garbage-collected: leave it to be
+		// recreated once it is gone, rather than re-issuing the delete (and re-emitting the
+		// StorageExpanded event) on every requeue while the old object lingers in Terminating.
+		if ss.DeletionTimestamp != nil {
+			continue
+		}
+
+		// Defer the grow while a gated scale-down is pending for this pool. A live StatefulSet
+		// running more replicas than desired means ensureStatefulSet refused to scale it down
+		// because the surplus nodes have not been drained from the layout yet. Orphan-deleting
+		// now would recreate the StatefulSet at the reduced replica count (desiredStatefulSet
+		// uses pool.Replicas), deleting those pods without a drain and bypassing the
+		// reconcileDestructiveLayout guardrail — silent data loss. Let the gated drain reduce the
+		// pool first; the grow then proceeds once the live and desired counts agree.
+		if replicaCount(&ss) > pool.Replicas {
+			log.Info("Deferring storage grow until a pending scale-down is drained", "pool", pool.Name)
+			continue
+		}
+
 		grew, reason, growErr := r.planPoolStorage(ctx, cluster, pool, &ss)
 		if growErr != nil {
 			return false, growErr
@@ -143,9 +162,18 @@ func (r *GarageClusterReconciler) planPoolStorage(ctx context.Context, cluster *
 			return false, fmt.Sprintf("pool %q %s volume cannot shrink from %s to %s in place; use a storage migration",
 				pool.Name, v.name, current.String(), v.spec.Size.String()), nil
 		}
-		if expandable, scReason, scErr := r.storageClassExpandable(ctx, cluster.Namespace, ss.Name, v.name); scErr != nil {
+		expandable, scReason, scErr := r.storageClassExpandable(ctx, cluster.Namespace, ss.Name, v.name)
+		if scErr != nil {
 			return false, "", scErr
-		} else if !expandable {
+		}
+		if !expandable {
+			if scReason == "" {
+				// Transient (the volume's PVC is not provisioned yet): defer the whole pool's grow
+				// rather than refuse it, and rather than grow only the other volume and then
+				// recreate the StatefulSet with a template this volume's PVC has not caught up to.
+				// The next reconcile retries once the claim appears.
+				return false, "", nil
+			}
 			return false, fmt.Sprintf("pool %q %s volume cannot grow: %s", pool.Name, v.name, scReason), nil
 		}
 		grows = append(grows, growth{name: v.name, desired: v.spec.Size})
@@ -178,15 +206,17 @@ func templateStorageRequest(ss *appsv1.StatefulSet, volume string) (resource.Qua
 // storageClassExpandable reports whether the StorageClass backing a volume's PVCs permits
 // expansion. It reads the class name from the live ordinal-0 PVC (the API server records the
 // resolved default there), since that is the class the volumes were actually provisioned with.
-// When expansion is not allowed it returns a human-readable reason for the blocking condition.
+// When expansion is refused it returns a non-empty, human-readable reason for the blocking
+// condition. A return of (false, "", nil) means "not yet determinable" — a transient state the
+// caller should defer on, not surface as a refusal.
 func (r *GarageClusterReconciler) storageClassExpandable(ctx context.Context, namespace, statefulSet, volume string) (bool, string, error) {
 	var pvc corev1.PersistentVolumeClaim
 	key := client.ObjectKey{Name: claimName(volume, statefulSet, 0), Namespace: namespace}
 	if err := r.Get(ctx, key, &pvc); err != nil {
 		if apierrors.IsNotFound(err) {
-			// The StatefulSet exists but its first claim does not yet — too early to act. Report
-			// not-expandable with a transient reason; the next reconcile retries once it appears.
-			return false, "its PersistentVolumeClaim is not provisioned yet", nil
+			// The StatefulSet exists but its first claim does not yet — too early to act. Signal a
+			// transient deferral (empty reason) so the next reconcile retries once it appears.
+			return false, "", nil
 		}
 		return false, "", err
 	}
