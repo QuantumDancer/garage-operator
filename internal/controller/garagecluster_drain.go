@@ -170,10 +170,7 @@ func (r *GarageClusterReconciler) reconcileRemovedWorkload(ctx context.Context, 
 
 	for i := range sets.Items {
 		ss := &sets.Items[i]
-		current := int32(0)
-		if ss.Spec.Replicas != nil {
-			current = *ss.Spec.Replicas
-		}
+		current := replicaCount(ss)
 
 		want, kept := desiredReplicas[ss.Name]
 		if !kept {
