@@ -12,6 +12,7 @@ import (
 const (
 	zoneDefault = "default"
 	nodeID1     = "node-1"
+	nodeStale   = "node-stale"
 )
 
 // fakeAdmin is a minimal stand-in for the Garage Admin API. Each field is the JSON the
@@ -27,6 +28,13 @@ type fakeAdmin struct {
 	appliedVersions []int64
 	updateCalls     int
 	applyCalls      int
+	revertCalls     int
+	previewCalls    int
+
+	// previewMessage is returned from PreviewClusterLayoutChanges. previewError, when set,
+	// is returned as the error variant instead.
+	previewMessage []string
+	previewError   string
 
 	// connectResults, when set, is returned from ConnectClusterNodes (one entry per peer).
 	// When nil the server reports success for every requested peer.
@@ -81,6 +89,24 @@ func (f *fakeAdmin) server() *httptest.Server {
 			// Reflect the apply into the layout so a follow-up GET is converged.
 			f.layout.Version = body.Version
 			f.encode(w, ApplyClusterLayoutResponse{})
+		case "/v2/PreviewClusterLayoutChanges":
+			f.previewCalls++
+			var resp PreviewClusterLayoutChangesResponse
+			if f.previewError != "" {
+				if err := resp.FromPreviewClusterLayoutChangesResponse0(
+					PreviewClusterLayoutChangesResponse0{Error: f.previewError}); err != nil {
+					f.t.Fatalf("build preview error: %v", err)
+				}
+			} else {
+				if err := resp.FromPreviewClusterLayoutChangesResponse1(
+					PreviewClusterLayoutChangesResponse1{Message: f.previewMessage}); err != nil {
+					f.t.Fatalf("build preview success: %v", err)
+				}
+			}
+			f.encode(w, resp)
+		case "/v2/RevertClusterLayout":
+			f.revertCalls++
+			f.encode(w, f.layout)
 		default:
 			f.t.Errorf("unexpected request path %q", r.URL.Path)
 			http.Error(w, "unexpected", http.StatusNotFound)
@@ -224,6 +250,160 @@ func TestEnsureLayoutIdempotentWhenConverged(t *testing.T) {
 	}
 	if fake.updateCalls != 0 || fake.applyCalls != 0 {
 		t.Errorf("update/apply calls = %d/%d, want 0/0 on a converged cluster", fake.updateCalls, fake.applyCalls)
+	}
+}
+
+func TestPlanLayoutDetectsRemovalAndAdditive(t *testing.T) {
+	// node-1 is already in the layout and stays; node-stale is in the layout but no longer
+	// desired (a removal); node-new is desired but absent (an additive change).
+	fake := &fakeAdmin{
+		t: t,
+		layout: GetClusterLayoutResponse{
+			Version: 7,
+			Roles: []LayoutNodeRole{
+				{Id: nodeID1, Zone: zoneDefault, Capacity: ptrInt64(1 << 40)},
+				{Id: nodeStale, Zone: zoneDefault, Capacity: ptrInt64(1 << 40)},
+			},
+		},
+	}
+	client := newTestClient(t, fake)
+
+	plan, err := client.PlanLayout(context.Background(), []DesiredRole{
+		{NodeID: nodeID1, Zone: zoneDefault, Capacity: 1 << 40},
+		{NodeID: "node-new", Zone: zoneDefault, Capacity: 1 << 40},
+	})
+	if err != nil {
+		t.Fatalf("PlanLayout: %v", err)
+	}
+	if plan.CurrentVersion != 7 || plan.TargetVersion != 8 {
+		t.Errorf("versions = %d/%d, want current 7 target 8", plan.CurrentVersion, plan.TargetVersion)
+	}
+	if !plan.IsDestructive() {
+		t.Error("IsDestructive = false, want true (node-stale is removed)")
+	}
+	if len(plan.Removals) != 1 || plan.Removals[0] != nodeStale {
+		t.Errorf("removals = %v, want [node-stale]", plan.Removals)
+	}
+	if len(plan.AdditiveChanges) != 1 {
+		t.Fatalf("additive changes = %d, want 1 (node-new)", len(plan.AdditiveChanges))
+	}
+	add, err := plan.AdditiveChanges[0].AsNodeRoleChangeRequest1()
+	if err != nil {
+		t.Fatalf("decode additive change: %v", err)
+	}
+	if add.Id != "node-new" {
+		t.Errorf("additive change id = %q, want node-new", add.Id)
+	}
+
+	// StagedChanges carries the additive assignment followed by the removal.
+	staged, err := plan.StagedChanges()
+	if err != nil {
+		t.Fatalf("StagedChanges: %v", err)
+	}
+	if len(staged) != 2 {
+		t.Fatalf("staged changes = %d, want 2", len(staged))
+	}
+	removal, err := staged[1].AsNodeRoleChangeRequest0()
+	if err != nil {
+		t.Fatalf("decode removal change: %v", err)
+	}
+	if removal.Id != nodeStale || !removal.Remove {
+		t.Errorf("removal change = %+v, want id=node-stale remove=true", removal)
+	}
+}
+
+func TestPlanLayoutCleanWhenConverged(t *testing.T) {
+	fake := &fakeAdmin{
+		t: t,
+		layout: GetClusterLayoutResponse{
+			Version: 3,
+			Roles: []LayoutNodeRole{
+				{Id: nodeID1, Zone: zoneDefault, Capacity: ptrInt64(1 << 40)},
+			},
+		},
+	}
+	client := newTestClient(t, fake)
+
+	plan, err := client.PlanLayout(context.Background(), []DesiredRole{
+		{NodeID: nodeID1, Zone: zoneDefault, Capacity: 1 << 40},
+	})
+	if err != nil {
+		t.Fatalf("PlanLayout: %v", err)
+	}
+	if plan.HasChanges() || plan.IsDestructive() {
+		t.Errorf("plan = %+v, want no changes on a converged cluster", plan)
+	}
+	if plan.TargetVersion != 0 {
+		t.Errorf("target version = %d, want 0 for an empty plan", plan.TargetVersion)
+	}
+}
+
+func TestPreviewStagedChangesReturnsMessage(t *testing.T) {
+	fake := &fakeAdmin{t: t, previewMessage: []string{"line 1", "line 2"}}
+	client := newTestClient(t, fake)
+
+	msg, err := client.PreviewStagedChanges(context.Background())
+	if err != nil {
+		t.Fatalf("PreviewStagedChanges: %v", err)
+	}
+	if len(msg) != 2 || msg[0] != "line 1" || msg[1] != "line 2" {
+		t.Errorf("message = %v, want [line 1, line 2]", msg)
+	}
+}
+
+func TestPreviewStagedChangesSurfacesError(t *testing.T) {
+	fake := &fakeAdmin{t: t, previewError: "layout cannot be computed"}
+	client := newTestClient(t, fake)
+
+	_, err := client.PreviewStagedChanges(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "layout cannot be computed") {
+		t.Errorf("error = %v, want it to surface the computation failure", err)
+	}
+}
+
+func TestStageApplyRevertHitEndpoints(t *testing.T) {
+	fake := &fakeAdmin{
+		t:      t,
+		layout: GetClusterLayoutResponse{Version: 4, Roles: []LayoutNodeRole{}},
+	}
+	client := newTestClient(t, fake)
+	ctx := context.Background()
+
+	change, err := removeRoleChange(nodeStale)
+	if err != nil {
+		t.Fatalf("removeRoleChange: %v", err)
+	}
+	if err := client.StageLayoutChanges(ctx, []NodeRoleChangeRequest{change}); err != nil {
+		t.Fatalf("StageLayoutChanges: %v", err)
+	}
+	if fake.updateCalls != 1 {
+		t.Errorf("update calls = %d, want 1", fake.updateCalls)
+	}
+
+	if err := client.ApplyLayout(ctx, 5); err != nil {
+		t.Fatalf("ApplyLayout: %v", err)
+	}
+	if fake.applyCalls != 1 || fake.appliedVersions[0] != 5 {
+		t.Errorf("apply calls/version = %d/%v, want 1/[5]", fake.applyCalls, fake.appliedVersions)
+	}
+
+	if err := client.RevertStagedChanges(ctx); err != nil {
+		t.Fatalf("RevertStagedChanges: %v", err)
+	}
+	if fake.revertCalls != 1 {
+		t.Errorf("revert calls = %d, want 1", fake.revertCalls)
+	}
+}
+
+func TestStageLayoutChangesNoOpOnEmpty(t *testing.T) {
+	fake := &fakeAdmin{t: t}
+	client := newTestClient(t, fake)
+
+	if err := client.StageLayoutChanges(context.Background(), nil); err != nil {
+		t.Fatalf("StageLayoutChanges: %v", err)
+	}
+	if fake.updateCalls != 0 {
+		t.Errorf("update calls = %d, want 0 for empty changes", fake.updateCalls)
 	}
 }
 

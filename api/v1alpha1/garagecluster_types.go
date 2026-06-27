@@ -319,7 +319,7 @@ type EndpointsStatus struct {
 // GarageClusterStatus defines the observed state of GarageCluster.
 type GarageClusterStatus struct {
 	// conditions represent the current state of the GarageCluster resource.
-	// Known types: Ready, WorkloadReady, PeersConnected, LayoutApplied.
+	// Known types: Ready, WorkloadReady, PeersConnected, LayoutApplied, LayoutChangePending.
 	// +listType=map
 	// +listMapKey=type
 	// +optional

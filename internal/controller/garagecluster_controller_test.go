@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -43,11 +44,63 @@ type meshRecorder struct {
 	peers [][]string
 }
 
+// fakeLayout simulates the cluster-wide Garage layout. A single instance is shared across
+// the per-pod fake admin clients one reconcile creates and persists across reconciles, so
+// PlanLayout/ApplyLayout behave like a real cluster converging over successive passes:
+// applying commits the last-planned desired set as the new applied layout and bumps the
+// version, which is what later PlanLayout calls diff against.
+type fakeLayout struct {
+	version     int64
+	applied     map[string]struct{}
+	lastDesired []garageadmin.DesiredRole
+	applyCalls  int
+	previewMsg  []string
+}
+
+func newFakeLayout() *fakeLayout {
+	return &fakeLayout{applied: map[string]struct{}{}, previewMsg: []string{"fake preview"}}
+}
+
+// plan diffs the desired roles against the applied layout, mirroring garageadmin.PlanLayout:
+// desired nodes absent from the layout are additive, applied nodes no longer desired are
+// removals. AdditiveChanges only needs the right length here — the controller acts on its
+// count, not its contents.
+func (l *fakeLayout) plan(desired []garageadmin.DesiredRole) *garageadmin.LayoutPlan {
+	l.lastDesired = desired
+	wanted := make(map[string]struct{}, len(desired))
+	plan := &garageadmin.LayoutPlan{CurrentVersion: l.version}
+	for _, d := range desired {
+		wanted[d.NodeID] = struct{}{}
+		if _, ok := l.applied[d.NodeID]; !ok {
+			plan.AdditiveChanges = append(plan.AdditiveChanges, garageadmin.NodeRoleChangeRequest{})
+		}
+	}
+	for id := range l.applied {
+		if _, ok := wanted[id]; !ok {
+			plan.Removals = append(plan.Removals, id)
+		}
+	}
+	if plan.HasChanges() {
+		plan.TargetVersion = l.version + 1
+	}
+	return plan
+}
+
+func (l *fakeLayout) apply(version int64) {
+	l.version = version
+	l.applied = make(map[string]struct{}, len(l.lastDesired))
+	for _, d := range l.lastDesired {
+		l.applied[d.NodeID] = struct{}{}
+	}
+	l.applyCalls++
+}
+
 // fakeClusterAdmin stands in for the Garage Admin API so reconcile logic can run in envtest,
 // where no real Garage process exists.
 type fakeClusterAdmin struct {
 	nodeID   string
 	recorder *meshRecorder
+	layout   *fakeLayout
 }
 
 func (f *fakeClusterAdmin) NodeID(context.Context) (string, error) { return f.nodeID, nil }
@@ -60,9 +113,24 @@ func (f *fakeClusterAdmin) ConnectNodes(_ context.Context, peers []string) error
 	return nil
 }
 
-func (f *fakeClusterAdmin) EnsureLayout(context.Context, []garageadmin.DesiredRole) (bool, int64, error) {
-	return true, 1, nil
+func (f *fakeClusterAdmin) PlanLayout(_ context.Context, desired []garageadmin.DesiredRole) (*garageadmin.LayoutPlan, error) {
+	return f.layout.plan(desired), nil
 }
+
+func (f *fakeClusterAdmin) StageLayoutChanges(context.Context, []garageadmin.NodeRoleChangeRequest) error {
+	return nil
+}
+
+func (f *fakeClusterAdmin) PreviewStagedChanges(context.Context) ([]string, error) {
+	return f.layout.previewMsg, nil
+}
+
+func (f *fakeClusterAdmin) ApplyLayout(_ context.Context, version int64) error {
+	f.layout.apply(version)
+	return nil
+}
+
+func (f *fakeClusterAdmin) RevertStagedChanges(context.Context) error { return nil }
 
 // newBasicClusterSpec returns a single-pool GarageCluster spec (no S3, default storage) with
 // the given replication factor and replica count, as the API server would present it after
@@ -109,12 +177,13 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
 
 	mesh := &meshRecorder{}
+	layout := newFakeLayout()
 	reconcilerWithFakeAdmin := func() *GarageClusterReconciler {
 		return &GarageClusterReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			NewAdminClient: func(string, string) (clusterAdmin, error) {
-				return &fakeClusterAdmin{nodeID: "node-self", recorder: mesh}, nil
+				return &fakeClusterAdmin{nodeID: "node-self", recorder: mesh, layout: layout}, nil
 			},
 		}
 	}
@@ -275,12 +344,13 @@ var _ = Describe("GarageCluster multi-node mesh", Ordered, func() {
 	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
 
 	mesh := &meshRecorder{}
+	layout := newFakeLayout()
 	reconciler := func() *GarageClusterReconciler {
 		return &GarageClusterReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
 			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
-				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), recorder: mesh}, nil
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), recorder: mesh, layout: layout}, nil
 			},
 		}
 	}
@@ -329,5 +399,335 @@ var _ = Describe("GarageCluster multi-node mesh", Ordered, func() {
 		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionPeersConnected)).To(BeTrue())
 		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady)).To(BeTrue())
 		Expect(cluster.Status.Layout.Nodes).To(HaveLen(3))
+	})
+})
+
+// createPVC simulates a volumeClaimTemplates PVC that a real StatefulSet controller would
+// create. envtest runs no such controller, so the drain tests stand them up explicitly to
+// assert the operator reclaims the right ones.
+func createPVC(ctx context.Context, namespace, name string) {
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: apiresource.MustParse("1Gi")},
+			},
+		},
+	}
+	Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+}
+
+// pvcExists reports whether a PVC is present and not being deleted. envtest enables the
+// StorageObjectInUseProtection admission plugin, which stamps every PVC with the
+// kubernetes.io/pvc-protection finalizer, but runs no controller to clear it — so a deleted
+// PVC lingers in Terminating. A non-zero deletion timestamp therefore means "gone".
+//
+//nolint:unparam // namespace is a parameter for symmetry with createPVC; tests use "default".
+func pvcExists(ctx context.Context, namespace, name string) bool {
+	var pvc corev1.PersistentVolumeClaim
+	if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, &pvc); err != nil {
+		return false
+	}
+	return pvc.DeletionTimestamp.IsZero()
+}
+
+var _ = Describe("GarageCluster destructive layout (scale-down)", Ordered, func() {
+	const (
+		resourceName      = "drain"
+		resourceNamespace = "default"
+		ssName            = "drain-default"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	mesh := &meshRecorder{}
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), recorder: mesh, layout: layout}, nil
+			},
+		}
+	}
+
+	markReady := func(replicas int32) {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = replicas
+		ss.Status.ReadyReplicas = replicas
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(3, 3),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+		By("converging the 3-node cluster to Ready")
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		markReady(3)
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+
+		By("standing up the PVCs the StatefulSet controller would have created")
+		for ord := range 3 {
+			for _, vol := range []string{volumeNameMeta, volumeNameData} {
+				createPVC(ctx, resourceNamespace, fmt.Sprintf("%s-%s-%d", vol, ssName, ord))
+			}
+		}
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("holds the scale-down behind the approval annotation", func() {
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Spec.NodePools[0].Replicas = 2
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("not scaling the StatefulSet down")
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		Expect(*ss.Spec.Replicas).To(Equal(int32(3)))
+
+		By("reporting LayoutChangePending and not applying the drain")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionLayoutChangePending)).To(BeTrue())
+		Expect(layout.applyCalls).To(Equal(1))
+
+		By("keeping the cluster Ready while the change is pending")
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady)).To(BeTrue())
+	})
+
+	It("ignores an approval annotation for a stale target version", func() {
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Annotations = map[string]string{annotationApproveLayout: "99"}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionLayoutChangePending)).To(BeTrue())
+	})
+
+	It("drains the node and reclaims its PVCs once approved", func() {
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		// The pending change targets version current(1)+1 = 2.
+		cluster.Annotations = map[string]string{annotationApproveLayout: "2"}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("applying the drain exactly once")
+		Expect(layout.applyCalls).To(Equal(2))
+
+		By("scaling the StatefulSet down to the desired replica count")
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		Expect(*ss.Spec.Replicas).To(Equal(int32(2)))
+
+		By("deleting the drained node's PVCs but keeping the survivors'")
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-2", vol, ssName))).To(BeFalse())
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-0", vol, ssName))).To(BeTrue())
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-1", vol, ssName))).To(BeTrue())
+		}
+
+		By("clearing the pending condition and reporting the new layout")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(meta.FindStatusCondition(cluster.Status.Conditions, conditionLayoutChangePending)).To(BeNil())
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionLayoutApplied)).To(BeTrue())
+		Expect(cluster.Status.Layout.Version).To(Equal(int64(2)))
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(2))
+	})
+})
+
+var _ = Describe("GarageCluster destructive layout (rf=1 blocked)", Ordered, func() {
+	const (
+		resourceName      = "rf1"
+		resourceNamespace = "default"
+		ssName            = "rf1-default"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), layout: layout}, nil
+			},
+		}
+	}
+
+	markReady := func(replicas int32) {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = replicas
+		ss.Status.ReadyReplicas = replicas
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(1, 2),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		markReady(2)
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("refuses the removal even when approved", func() {
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Spec.NodePools[0].Replicas = 1
+		// Pre-approve the would-be target version; the rf guardrail must still refuse.
+		cluster.Annotations = map[string]string{annotationApproveLayout: "2"}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("not applying and not scaling down")
+		Expect(layout.applyCalls).To(Equal(1))
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		Expect(*ss.Spec.Replicas).To(Equal(int32(2)))
+
+		By("reporting LayoutChangePending=False with reason Blocked")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cond := meta.FindStatusCondition(cluster.Status.Conditions, conditionLayoutChangePending)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal("Blocked"))
+	})
+})
+
+var _ = Describe("GarageCluster destructive layout (whole-pool removal)", Ordered, func() {
+	const (
+		resourceName      = "rmpool"
+		resourceNamespace = "default"
+		ssA               = "rmpool-a"
+		ssB               = "rmpool-b"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), layout: layout}, nil
+			},
+		}
+	}
+
+	markReady := func(name string) {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = 1
+		ss.Status.ReadyReplicas = 1
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	twoPoolSpec := func() garagev1alpha1.GarageClusterSpec {
+		spec := newBasicClusterSpec(2, 1)
+		spec.NodePools[0].Name = "a"
+		pool := spec.NodePools[0]
+		pool.Name = "b"
+		spec.NodePools = append(spec.NodePools, pool)
+		return spec
+	}
+
+	BeforeAll(func() {
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       twoPoolSpec(),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		markReady(ssA)
+		markReady(ssB)
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			createPVC(ctx, resourceNamespace, fmt.Sprintf("%s-%s-0", vol, ssB))
+		}
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("deletes the removed pool's StatefulSet and PVCs once approved", func() {
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Spec.NodePools = cluster.Spec.NodePools[:1] // drop pool "b"
+		cluster.Annotations = map[string]string{annotationApproveLayout: "2"}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(2))
+
+		By("deleting pool b's StatefulSet")
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: ssB, Namespace: resourceNamespace}, &appsv1.StatefulSet{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+		By("deleting pool b's PVCs and keeping pool a")
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-0", vol, ssB))).To(BeFalse())
+		}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssA, Namespace: resourceNamespace}, &appsv1.StatefulSet{})).To(Succeed())
+
+		By("reporting a single-node layout")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(1))
 	})
 })

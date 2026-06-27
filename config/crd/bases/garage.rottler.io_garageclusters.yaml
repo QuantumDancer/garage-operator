@@ -1329,7 +1329,7 @@ spec:
               conditions:
                 description: |-
                   conditions represent the current state of the GarageCluster resource.
-                  Known types: Ready, WorkloadReady, PeersConnected, LayoutApplied.
+                  Known types: Ready, WorkloadReady, PeersConnected, LayoutApplied, LayoutChangePending.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

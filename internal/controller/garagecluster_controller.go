@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -41,11 +42,18 @@ import (
 
 // Condition types reported on GarageCluster status.
 const (
-	conditionReady          = "Ready"
-	conditionWorkloadReady  = "WorkloadReady"
-	conditionPeersConnected = "PeersConnected"
-	conditionLayoutApplied  = "LayoutApplied"
+	conditionReady               = "Ready"
+	conditionWorkloadReady       = "WorkloadReady"
+	conditionPeersConnected      = "PeersConnected"
+	conditionLayoutApplied       = "LayoutApplied"
+	conditionLayoutChangePending = "LayoutChangePending"
 )
+
+// annotationApproveLayout gates a destructive layout change (node drain/removal). Set its
+// value to the pending target layout version reported in the LayoutChangePending condition
+// to authorize the operator to apply the drain. Keying approval to the version means a stale
+// approval is ignored once the desired state — and thus the target version — changes again.
+const annotationApproveLayout = "garage.rottler.io/approve-layout"
 
 // workloadRequeue is how long to wait before re-checking pods/admin API while the cluster
 // converges. Garage convergence emits no Kubernetes events, so these steps poll.
@@ -62,7 +70,11 @@ const steadyStateRequeue = time.Minute
 type clusterAdmin interface {
 	NodeID(ctx context.Context) (string, error)
 	ConnectNodes(ctx context.Context, peers []string) error
-	EnsureLayout(ctx context.Context, desired []garageadmin.DesiredRole) (applied bool, version int64, err error)
+	PlanLayout(ctx context.Context, desired []garageadmin.DesiredRole) (*garageadmin.LayoutPlan, error)
+	StageLayoutChanges(ctx context.Context, changes []garageadmin.NodeRoleChangeRequest) error
+	PreviewStagedChanges(ctx context.Context) ([]string, error)
+	ApplyLayout(ctx context.Context, version int64) error
+	RevertStagedChanges(ctx context.Context) error
 	Health(ctx context.Context) (*garageadmin.GetClusterHealthResponse, error)
 }
 
@@ -74,6 +86,10 @@ type GarageClusterReconciler struct {
 	// NewAdminClient builds an admin client for a single node's endpoint. Defaulted to the
 	// real Garage Admin API client; overridden in tests.
 	NewAdminClient func(baseURL, token string) (clusterAdmin, error)
+
+	// Recorder emits Events onto the CR (e.g. that a destructive layout change is awaiting
+	// approval) so the reason is visible in `kubectl describe`, not just a status condition.
+	Recorder record.EventRecorder
 }
 
 func defaultAdminClientFactory(baseURL, token string) (clusterAdmin, error) {
@@ -85,7 +101,8 @@ func defaultAdminClientFactory(baseURL, token string) (clusterAdmin, error) {
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garageclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services;configmaps;secrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=pods;persistentvolumeclaims,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 // Reconcile drives the observed cluster toward the GarageCluster spec: it provisions the
@@ -155,16 +172,15 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		setCondition(status, conditionPeersConnected, metav1.ConditionTrue, "SingleNode", "Single-node cluster needs no peering")
 	}
 
-	_, version, err := layoutClient.EnsureLayout(ctx, desiredRoles(desired))
-	if err != nil {
-		setCondition(status, conditionLayoutApplied, metav1.ConditionFalse, "LayoutError", err.Error())
-		return ctrl.Result{}, err
-	}
-	setCondition(status, conditionLayoutApplied, metav1.ConditionTrue, "LayoutApplied", fmt.Sprintf("Cluster layout version %d applied", version))
-	status.Layout = buildLayoutStatus(desired, version)
-
+	// Refresh health before the layout step: the destructive-layout guardrail refuses to
+	// drain a node while the cluster is unhealthy.
 	if health, herr := layoutClient.Health(ctx); herr == nil {
 		status.Health = buildHealthStatus(health)
+	}
+
+	if err := r.reconcileLayout(ctx, &cluster, status, layoutClient, desired); err != nil {
+		setCondition(status, conditionReady, metav1.ConditionFalse, "LayoutError", err.Error())
+		return ctrl.Result{}, err
 	}
 
 	setCondition(status, conditionReady, metav1.ConditionTrue, "ClusterReady", "Garage cluster is ready")
@@ -289,17 +305,28 @@ func (r *GarageClusterReconciler) ensureStatefulSet(ctx context.Context, cluster
 	if err != nil {
 		return err
 	}
-	if equalInt32Ptr(existing.Spec.Replicas, desired.Spec.Replicas) &&
+	// Never scale a StatefulSet down here. A replica reduction is a destructive layout
+	// change: the nodes must first be drained from the Garage layout so their data is
+	// redistributed to replicas. The gated drain path (reconcileRemovedWorkload) owns
+	// scale-down; here we only ever create, scale up, or roll the pod template.
+	desiredReplicas := desired.Spec.Replicas
+	if existing.Spec.Replicas != nil && desiredReplicas != nil && *desiredReplicas < *existing.Spec.Replicas {
+		desiredReplicas = existing.Spec.Replicas
+	}
+	if equalInt32Ptr(existing.Spec.Replicas, desiredReplicas) &&
 		apiequality.Semantic.DeepEqual(existing.Spec.Template, desired.Spec.Template) {
 		return nil
 	}
-	existing.Spec.Replicas = desired.Spec.Replicas
+	existing.Spec.Replicas = desiredReplicas
 	existing.Spec.Template = desired.Spec.Template
 	return r.Update(ctx, &existing)
 }
 
-// workloadReady reports whether every pool's StatefulSet has all replicas ready for its
-// current generation.
+// workloadReady reports whether every pool's StatefulSet has all of its current replicas
+// ready for its current generation. Readiness is measured against each StatefulSet's own
+// replica count, not the pool's desired count: during a gated scale-down the StatefulSet
+// deliberately runs more replicas than spec until the drain is applied, and those extra pods
+// must still count as ready for the drain to proceed.
 func (r *GarageClusterReconciler) workloadReady(ctx context.Context, cluster *garagev1alpha1.GarageCluster) (bool, error) {
 	for i := range cluster.Spec.NodePools {
 		pool := &cluster.Spec.NodePools[i]
@@ -311,7 +338,11 @@ func (r *GarageClusterReconciler) workloadReady(ctx context.Context, cluster *ga
 			}
 			return false, err
 		}
-		if ss.Status.ObservedGeneration != ss.Generation || ss.Status.ReadyReplicas != pool.Replicas {
+		want := int32(0)
+		if ss.Spec.Replicas != nil {
+			want = *ss.Spec.Replicas
+		}
+		if ss.Status.ObservedGeneration != ss.Generation || ss.Status.ReadyReplicas != want {
 			return false, nil
 		}
 	}

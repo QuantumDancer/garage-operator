@@ -385,6 +385,130 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
 		})
 
+		It("should gate a node drain behind approval, then reclaim the node's PVCs", func() {
+			const clusterNamespace = "garage-drain-e2e"
+			const clusterName = "drain"
+			const ssName = "drain-default"
+
+			By("preloading the Garage image into the Kind cluster")
+			_, err := utils.Run(exec.Command("docker", "pull", garageImage))
+			Expect(err).NotTo(HaveOccurred(), "Failed to pull the Garage image")
+			Expect(utils.LoadImageToKindClusterWithName(garageImage)).To(Succeed(), "Failed to load Garage image into Kind")
+
+			By("creating the drain-test namespace")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", clusterNamespace))
+
+			// replicationFactor 2 with 3 nodes: scaling to 2 nodes still satisfies the factor,
+			// so the cluster stays healthy after the drain (unlike an rf=3 cluster, which needs
+			// at least 3 nodes).
+			By("applying a 3-node, replication-factor-2 GarageCluster")
+			manifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicationFactor: 2
+  nodePools:
+    - name: default
+      replicas: 3
+      storage:
+        data: { size: 1Gi }
+        meta: { size: 1Gi }
+`, clusterName, clusterNamespace)
+			manifestFile := filepath.Join("/tmp", "garagecluster-drain-e2e.yaml")
+			Expect(os.WriteFile(manifestFile, []byte(manifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", manifestFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
+
+			getStatus := func(jsonPath string) (string, error) {
+				return utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", clusterNamespace, "-o", "jsonpath="+jsonPath))
+			}
+
+			By("waiting for the 3-node cluster to become Ready")
+			verifyReady := func(g Gomega) {
+				ready, err := getStatus("{.status.conditions[?(@.type=='Ready')].status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "GarageCluster is not Ready")
+				nodes, err := getStatus("{.status.layout.nodes[*].nodeId}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(utils.GetNonEmptyLines(strings.ReplaceAll(nodes, " ", "\n"))).
+					To(HaveLen(3), "all three nodes should be in the layout")
+			}
+			Eventually(verifyReady, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("recording the applied layout version to derive the approval target")
+			currentVersionStr, err := getStatus("{.status.layout.version}")
+			Expect(err).NotTo(HaveOccurred())
+			currentVersion, err := strconv.Atoi(currentVersionStr)
+			Expect(err).NotTo(HaveOccurred())
+			targetVersion := currentVersion + 1
+
+			By("requesting a scale-down from 3 to 2 replicas")
+			_, err = utils.Run(exec.Command("kubectl", "patch", "garagecluster", clusterName,
+				"-n", clusterNamespace, "--type=json",
+				"-p", `[{"op":"replace","path":"/spec/nodePools/0/replicas","value":2}]`))
+			Expect(err).NotTo(HaveOccurred(), "Failed to patch replicas")
+
+			By("holding the drain behind the approval annotation: still 3 nodes, change pending")
+			verifyPending := func(g Gomega) {
+				pending, err := getStatus("{.status.conditions[?(@.type=='LayoutChangePending')].status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(pending).To(Equal("True"), "expected a pending destructive layout change")
+
+				replicas, err := utils.Run(exec.Command("kubectl", "get", "statefulset", ssName,
+					"-n", clusterNamespace, "-o", "jsonpath={.spec.replicas}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(replicas).To(Equal("3"), "StatefulSet must not scale down before approval")
+
+				nodes, err := getStatus("{.status.layout.nodes[*].nodeId}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(utils.GetNonEmptyLines(strings.ReplaceAll(nodes, " ", "\n"))).
+					To(HaveLen(3), "the node must not be drained before approval")
+			}
+			Eventually(verifyPending, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("approving the drain via the layout-approval annotation")
+			_, err = utils.Run(exec.Command("kubectl", "annotate", "garagecluster", clusterName,
+				"-n", clusterNamespace,
+				fmt.Sprintf("garage.rottler.io/approve-layout=%d", targetVersion), "--overwrite"))
+			Expect(err).NotTo(HaveOccurred(), "Failed to annotate approval")
+
+			By("draining the node: layout shrinks to 2, the StatefulSet scales down, health stays healthy")
+			verifyDrained := func(g Gomega) {
+				nodes, err := getStatus("{.status.layout.nodes[*].nodeId}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(utils.GetNonEmptyLines(strings.ReplaceAll(nodes, " ", "\n"))).
+					To(HaveLen(2), "the drained node should leave the layout")
+
+				replicas, err := utils.Run(exec.Command("kubectl", "get", "statefulset", ssName,
+					"-n", clusterNamespace, "-o", "jsonpath={.spec.replicas}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(replicas).To(Equal("2"), "StatefulSet should be scaled down")
+
+				health, err := getStatus("{.status.health.status}")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(health).To(Equal("healthy"), "cluster should stay healthy after the drain")
+			}
+			Eventually(verifyDrained, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("reclaiming the drained node's PVCs (ordinal 2)")
+			verifyClaimsGone := func(g Gomega) {
+				for _, vol := range []string{"meta", "data"} {
+					out, _ := utils.Run(exec.Command("kubectl", "get", "pvc",
+						fmt.Sprintf("%s-%s-2", vol, ssName), "-n", clusterNamespace,
+						"--ignore-not-found", "-o", "jsonpath={.metadata.name}"))
+					g.Expect(out).To(BeEmpty(), "drained node's %s PVC should be deleted", vol)
+				}
+			}
+			Eventually(verifyClaimsGone, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("cleaning up the GarageCluster")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", manifestFile))
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clusterNamespace))
+		})
+
 		It("should provision a GarageBucket against a single-node cluster", func() {
 			const bucketNamespace = "garage-bucket-e2e"
 			const clusterName = "bkt"

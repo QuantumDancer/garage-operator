@@ -49,6 +49,15 @@ const (
 	configFileKey   = "garage.toml"
 )
 
+// volumeNameMeta and volumeNameData name the volumeClaimTemplates. They are the single
+// source of truth for the per-pod PVC names, which Kubernetes derives as
+// "<volumeName>-<statefulSetName>-<ordinal>" — the drain path relies on this to delete a
+// removed node's claims.
+const (
+	volumeNameMeta = "meta"
+	volumeNameData = "data"
+)
+
 // Label keys identifying the cluster and pool a resource belongs to. The pool label is
 // what lets the operator (and pod anti-affinity) distinguish StatefulSets within one cluster.
 const (
@@ -331,8 +340,8 @@ func desiredStatefulSet(c *garagev1alpha1.GarageCluster, pool *garagev1alpha1.No
 			{Name: "GARAGE_ADMIN_TOKEN", ValueFrom: secretEnvSource(admin)},
 		},
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: "meta", MountPath: metaMountPath},
-			{Name: "data", MountPath: dataMountPath},
+			{Name: volumeNameMeta, MountPath: metaMountPath},
+			{Name: volumeNameData, MountPath: dataMountPath},
 			{Name: "config", MountPath: configMountPath, SubPath: configFileKey, ReadOnly: true},
 		},
 		// Readiness/liveness use a TCP probe on the admin port rather than the admin
@@ -389,8 +398,8 @@ func desiredStatefulSet(c *garagev1alpha1.GarageCluster, pool *garagev1alpha1.No
 				},
 			},
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
-				volumeClaim("meta", pool.Storage.Meta),
-				volumeClaim("data", pool.Storage.Data),
+				volumeClaim(volumeNameMeta, pool.Storage.Meta),
+				volumeClaim(volumeNameData, pool.Storage.Data),
 			},
 		},
 	}
