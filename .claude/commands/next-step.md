@@ -37,9 +37,29 @@ slice. Iterate within this phase until all stages are green:
 4. Do not proceed to the summary while any stage is red. If a stage is genuinely
    blocked (e.g. e2e depends on a later step), say so explicitly and record it.
 
-## Phase 3 — Summarize & commit
+## Phase 3 — Commit & open PR
 
-1. Summarize what changed and the state of each test stage.
-2. If no open questions arose during coding, commit on a branch (not directly on
+1. If no open questions arose during coding, commit on a branch (not directly on
    `main`) and open a GitHub PR. If anything was ambiguous or needs a decision, ask instead of committing.
-   Do not commit `PLAN.md` or `references/` — they stay untracked.
+   Do not commit `PLAN.md` or `references/` — they are gitignored.
+
+## Phase 4 — Review & remediation (at most two passes)
+
+1. Launch a subagent with `/review <pr-id>` to trigger a review of the PR.
+2. Triage every flagged issue: confirm it is real before acting. If you believe a
+   finding is a hallucination or otherwise wrong, push back **in the same subagent
+   session** with your reasoning instead of silently dismissing it — let the
+   reviewer correct you or concede. You make the final call.
+3. Fix the genuine issues, then re-run the Phase 2 test ladder until all stages pass.
+4. Amend the fixes into the existing commit and force-push
+   (`git push --force-with-lease`) to update the PR.
+5. If you fixed anything in this pass, run **one** follow-up review by reusing the
+   same subagent session (so it remembers what it already flagged and only
+   re-checks the changes), then repeat steps 2–4 for any new genuine findings.
+   Stop after this follow-up regardless: at most one initial review and one
+   follow-up. If a pass surfaces nothing to fix, skip the remaining review.
+
+## Phase 5 — Summarize
+
+1. Summarize what changed, the review findings and how they were resolved, and
+   the final state of each test stage.
