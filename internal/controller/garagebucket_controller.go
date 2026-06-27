@@ -39,6 +39,7 @@ import (
 
 	garagev1alpha1 "github.com/QuantumDancer/garage-operator/api/v1alpha1"
 	"github.com/QuantumDancer/garage-operator/internal/garageadmin"
+	"github.com/QuantumDancer/garage-operator/internal/refpolicy"
 )
 
 // bucketFinalizer guards the Garage bucket against the CR vanishing before the operator has
@@ -55,6 +56,9 @@ const clusterPendingRequeue = 15 * time.Second
 const (
 	reasonClusterNotFound = "ClusterNotFound"
 	reasonClusterNotReady = "ClusterNotReady"
+	// reasonReferenceNotAllowed marks a bucket/key whose namespace is forbidden from
+	// referencing its target cluster by that cluster's spec.referencePolicy.
+	reasonReferenceNotAllowed = "ReferenceNotAllowed"
 )
 
 // bucketAdmin is the slice of the Garage Admin API the bucket controller needs. It is an
@@ -98,6 +102,7 @@ func defaultBucketAdminFactory(baseURL, token string) (bucketAdmin, error) {
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garageclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garagekeys,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 // Reconcile drives a Garage bucket toward the GarageBucket spec. It resolves the referenced
@@ -129,6 +134,21 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	status := bucket.Status.DeepCopy()
 	status.ObservedGeneration = bucket.Generation
+
+	// Hard backstop for the cluster's referencePolicy: admission only fires on this bucket, so
+	// a policy tightened on the cluster afterwards is caught only here. A denied reference never
+	// reaches the Admin API. The bucket re-reconciles when the cluster (and thus its policy)
+	// changes via the GarageCluster watch, so no requeue is needed.
+	allowed, reason, err := refpolicy.Check(ctx, r.Client, bucket.Spec.ClusterRef, bucket.Namespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !allowed {
+		log.Info("Reference not permitted by cluster referencePolicy", "reason", reason)
+		setBucketCondition(status, metav1.ConditionFalse, reasonReferenceNotAllowed, reason)
+		r.Recorder.Event(&bucket, corev1.EventTypeWarning, reasonReferenceNotAllowed, reason)
+		return r.finish(ctx, &bucket, status, ctrl.Result{})
+	}
 
 	conn, state, err := resolveClusterConnection(ctx, r.Client, bucket.Spec.ClusterRef, bucket.Namespace)
 	if err != nil {

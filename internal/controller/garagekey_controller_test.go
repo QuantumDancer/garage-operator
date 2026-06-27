@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -115,6 +116,7 @@ func newKeyReconciler(t *testing.T, admin keyAdmin, objs ...client.Object) (*Gar
 		Client:         c,
 		Scheme:         scheme,
 		NewAdminClient: func(string, string) (keyAdmin, error) { return admin, nil },
+		Recorder:       record.NewFakeRecorder(100),
 	}, c
 }
 
@@ -189,6 +191,27 @@ func TestKeyReconcilePendingWhenClusterNotReady(t *testing.T) {
 	}
 	if admin.createCalls != 0 {
 		t.Errorf("createCalls = %d, want 0 while pending", admin.createCalls)
+	}
+}
+
+// TestKeyReconcileDeniedByReferencePolicy is the controller backstop for the cluster's
+// referencePolicy: a key whose namespace the policy forbids must report ReferenceNotAllowed and
+// never touch the Admin API, even though the cluster is Ready.
+func TestKeyReconcileDeniedByReferencePolicy(t *testing.T) {
+	cluster, secret := readyCluster()
+	// testKeyNS ("media") is not in the allow-list and the cluster lives in "storage".
+	cluster.Spec.ReferencePolicy = &garagev1alpha1.ReferencePolicy{AllowedNamespaces: []string{"other"}}
+	admin := newFakeKeyAdmin()
+	r, c := newKeyReconciler(t, admin, keyCR(true, garagev1alpha1.GarageKeySpec{}), cluster, secret)
+
+	reconcileKey(t, r)
+
+	cond := meta.FindStatusCondition(getKey(t, c).Status.Conditions, conditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonReferenceNotAllowed {
+		t.Fatalf("Ready condition = %+v, want False/ReferenceNotAllowed", cond)
+	}
+	if admin.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 for a denied reference", admin.createCalls)
 	}
 }
 

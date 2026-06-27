@@ -298,6 +298,13 @@ type GarageClusterSpec struct {
 	// +optional
 	RpcSecret SecretBootstrap `json:"rpcSecret,omitempty"`
 
+	// referencePolicy restricts which namespaces may host GarageBucket / GarageKey
+	// resources that target this cluster via clusterRef. When omitted, any namespace
+	// may reference the cluster (the default, unrestricted behavior). The cluster's
+	// own namespace is always allowed.
+	// +optional
+	ReferencePolicy *ReferencePolicy `json:"referencePolicy,omitempty"`
+
 	// services configures exposure of the S3 and web endpoints.
 	// +optional
 	Services ServicesConfig `json:"services,omitempty"`
@@ -305,6 +312,23 @@ type GarageClusterSpec struct {
 	// s3 configures the S3 API and website settings.
 	// +optional
 	S3 S3Config `json:"s3,omitempty"`
+}
+
+// ReferencePolicy declares which namespaces may host GarageBucket / GarageKey
+// resources that reference this cluster. A reference is permitted when its namespace
+// is the cluster's own namespace, OR is listed in allowedNamespaces, OR matches
+// namespaceSelector. An empty policy ({}) therefore permits only the cluster's own
+// namespace.
+type ReferencePolicy struct {
+	// allowedNamespaces lists namespace names permitted to reference this cluster.
+	// +optional
+	// +listType=set
+	AllowedNamespaces []string `json:"allowedNamespaces,omitempty"`
+
+	// namespaceSelector permits any namespace whose labels match this selector.
+	// It is OR-ed with allowedNamespaces.
+	// +optional
+	NamespaceSelector *metav1.LabelSelector `json:"namespaceSelector,omitempty"`
 }
 
 // LayoutNodeStatus echoes one node's role in the applied Garage layout.
