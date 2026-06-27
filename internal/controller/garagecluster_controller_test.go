@@ -55,10 +55,19 @@ type fakeLayout struct {
 	lastDesired []garageadmin.DesiredRole
 	applyCalls  int
 	previewMsg  []string
+
+	// redundancy is the applied zone-redundancy parameter, defaulting to Garage's Maximum.
+	// redundancyCalls counts how many times the controller applied a change to it.
+	redundancy      garageadmin.ZoneRedundancyValue
+	redundancyCalls int
 }
 
 func newFakeLayout() *fakeLayout {
-	return &fakeLayout{applied: map[string]struct{}{}, previewMsg: []string{"fake preview"}}
+	return &fakeLayout{
+		applied:    map[string]struct{}{},
+		previewMsg: []string{"fake preview"},
+		redundancy: garageadmin.ZoneRedundancyValue{Maximum: true},
+	}
 }
 
 // plan diffs the desired roles against the applied layout, mirroring garageadmin.PlanLayout:
@@ -184,6 +193,17 @@ func (f *fakeClusterAdmin) ApplyLayout(_ context.Context, version int64) error {
 }
 
 func (f *fakeClusterAdmin) RevertStagedChanges(context.Context) error { return nil }
+
+func (f *fakeClusterAdmin) CurrentZoneRedundancy(context.Context) (garageadmin.ZoneRedundancyValue, error) {
+	return f.layout.redundancy, nil
+}
+
+func (f *fakeClusterAdmin) SetZoneRedundancy(_ context.Context, desired garageadmin.ZoneRedundancyValue) (int64, error) {
+	f.layout.redundancy = desired
+	f.layout.version++
+	f.layout.redundancyCalls++
+	return f.layout.version, nil
+}
 
 func (f *fakeClusterAdmin) AppliedLayoutNodeIDs(context.Context) ([]string, error) {
 	ids := make([]string, 0, len(f.layout.applied))

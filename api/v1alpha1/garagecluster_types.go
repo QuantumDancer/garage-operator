@@ -108,8 +108,17 @@ type NodePool struct {
 	Replicas int32 `json:"replicas"`
 
 	// zone is the Garage layout zone for this pool. Defaults to the pool name if omitted.
+	// Ignored when zoneFrom is set.
 	// +optional
 	Zone string `json:"zone,omitempty"`
+
+	// zoneFrom derives each node's Garage zone from this label on the Kubernetes Node the
+	// pod is scheduled on, letting one pool spread its replicas across failure domains. When
+	// set it takes precedence over zone, and the operator spreads the pool's pods across the
+	// label's values (a default topology-spread constraint). Every Node a pod lands on must
+	// carry the label, or that node defers until it does.
+	// +optional
+	ZoneFrom string `json:"zoneFrom,omitempty"`
 
 	// storage configures the data and metadata volumes.
 	// +kubebuilder:validation:Required
@@ -191,6 +200,32 @@ type GarageDBEngine string
 // +kubebuilder:validation:Enum=consistent;degraded;dangerous
 type GarageConsistencyMode string
 
+// ZoneRedundancyMode selects how partitions are replicated across zones.
+// +kubebuilder:validation:Enum=Maximum;AtLeast
+type ZoneRedundancyMode string
+
+const (
+	// ZoneRedundancyMaximum replicates each partition across as many distinct zones as
+	// possible (up to the replication factor) — Garage's default.
+	ZoneRedundancyMaximum ZoneRedundancyMode = "Maximum"
+	// ZoneRedundancyAtLeast replicates each partition across at least AtLeast distinct zones.
+	ZoneRedundancyAtLeast ZoneRedundancyMode = "AtLeast"
+)
+
+// ZoneRedundancy controls how many distinct zones each data partition is replicated across.
+type ZoneRedundancy struct {
+	// mode is Maximum (spread across as many zones as possible) or AtLeast.
+	// +kubebuilder:default=Maximum
+	// +optional
+	Mode ZoneRedundancyMode `json:"mode,omitempty"`
+
+	// atLeast is the minimum number of distinct zones each partition must span. Required when
+	// mode is AtLeast; ignored otherwise. Must not exceed the number of zones in the layout.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	AtLeast int `json:"atLeast,omitempty"`
+}
+
 // GarageClusterSpec defines the desired state of GarageCluster.
 type GarageClusterSpec struct {
 	// image selects the Garage container image.
@@ -236,13 +271,19 @@ type GarageClusterSpec struct {
 	// +optional
 	MetadataAutoSnapshotInterval string `json:"metadataAutoSnapshotInterval,omitempty"`
 
-	// nodePools defines one or more pools of Garage nodes. Each pool becomes a StatefulSet
-	// and maps to a single Garage zone.
+	// nodePools defines one or more pools of Garage nodes. Each pool becomes a StatefulSet.
+	// A pool maps to a single Garage zone unless it sets zoneFrom, which derives a per-node
+	// zone from the Node each pod runs on.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	// +listType=map
 	// +listMapKey=name
 	NodePools []NodePool `json:"nodePools"`
+
+	// zoneRedundancy controls how many distinct zones each partition replicates across
+	// (cross-zone replication). Defaults to Maximum.
+	// +optional
+	ZoneRedundancy *ZoneRedundancy `json:"zoneRedundancy,omitempty"`
 
 	// adminToken configures the Admin API token bootstrap.
 	// +optional

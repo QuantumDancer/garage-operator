@@ -70,6 +70,85 @@ func (r *GarageClusterReconciler) reconcileLayout(ctx context.Context, cluster *
 	return r.reconcileDestructiveLayout(ctx, cluster, status, layoutClient, desired, plan)
 }
 
+// desiredZoneRedundancy resolves the spec's zone-redundancy parameter, applying the operator
+// default (Maximum) when the block is omitted or its mode is empty. kubebuilder cannot fire the
+// nested mode default when the parent object is absent (the CRD nested-defaults gap), so the
+// default is applied here in the controller.
+func desiredZoneRedundancy(cluster *garagev1alpha1.GarageCluster) garageadmin.ZoneRedundancyValue {
+	zr := cluster.Spec.ZoneRedundancy
+	if zr == nil || zr.Mode == "" || zr.Mode == garagev1alpha1.ZoneRedundancyMaximum {
+		return garageadmin.ZoneRedundancyValue{Maximum: true}
+	}
+	return garageadmin.ZoneRedundancyValue{AtLeast: zr.AtLeast}
+}
+
+// distinctZones counts the distinct zones across the desired node set.
+func distinctZones(desired []nodeEndpoint) int {
+	zones := make(map[string]struct{}, len(desired))
+	for _, n := range desired {
+		zones[n.zone] = struct{}{}
+	}
+	return len(zones)
+}
+
+// reconcileZoneRedundancy converges the layout's cross-zone replication parameter toward spec.
+// The change is ungated (PLAN §10): it applies as soon as it is observed, guarded only by hard
+// preconditions — it never requests more zones than the layout actually has (Garage rejects
+// such a layout) and never starts the resulting rebalance from a degraded cluster. A blocked or
+// deferred change leaves the parameter untouched: a too-high AtLeast is surfaced as a
+// LayoutApplied=False misconfiguration, while an unhealthy cluster simply defers to a later
+// pass. The cluster keeps serving throughout, so Ready is left to the caller. status.Health
+// must already be set.
+func (r *GarageClusterReconciler) reconcileZoneRedundancy(ctx context.Context, cluster *garagev1alpha1.GarageCluster, status *garagev1alpha1.GarageClusterStatus, layoutClient clusterAdmin, desired []nodeEndpoint) error {
+	want := desiredZoneRedundancy(cluster)
+	current, err := layoutClient.CurrentZoneRedundancy(ctx)
+	if err != nil {
+		return err
+	}
+	if current.Equal(want) {
+		return nil
+	}
+
+	if !want.Maximum {
+		// Guardrail: mode AtLeast requires a positive atLeast. The kubebuilder Minimum=1 marker is
+		// only enforced when the field is present, so `{mode: AtLeast}` with atLeast omitted slips
+		// through admission as 0. Refuse it here rather than ship a nonsensical atLeast:0 to Garage
+		// (a validating webhook will reject it at admission in Phase 6).
+		if want.AtLeast < 1 {
+			msg := "Invalid zone redundancy: mode AtLeast requires atLeast >= 1"
+			setCondition(status, conditionLayoutApplied, metav1.ConditionFalse, "ZoneRedundancyInvalid", msg)
+			r.eventf(cluster, corev1.EventTypeWarning, "ZoneRedundancyBlocked", msg)
+			return nil
+		}
+		// Guardrail: AtLeast can never exceed the number of zones in the layout — Garage would
+		// reject the layout. Refuse without touching it and surface the misconfiguration.
+		if zones := distinctZones(desired); want.AtLeast > zones {
+			msg := fmt.Sprintf("Cannot set zone redundancy to %s: layout has only %d zone(s)", want, zones)
+			setCondition(status, conditionLayoutApplied, metav1.ConditionFalse, "ZoneRedundancyInvalid", msg)
+			r.eventf(cluster, corev1.EventTypeWarning, "ZoneRedundancyBlocked", msg)
+			return nil
+		}
+	}
+
+	// Guardrail: applying the change rebalances data across zones, so never start from a
+	// degraded cluster. Defer until healthy; the steady-state requeue retries.
+	if status.Health == nil || status.Health.Status != healthStatusHealthy {
+		logf.FromContext(ctx).Info("Deferring zone-redundancy change until the cluster is healthy", "desired", want.String())
+		return nil
+	}
+
+	version, err := layoutClient.SetZoneRedundancy(ctx, want)
+	if err != nil {
+		return err
+	}
+	if status.Layout != nil {
+		status.Layout.Version = version
+	}
+	r.eventf(cluster, corev1.EventTypeNormal, "ZoneRedundancyApplied", fmt.Sprintf("Applied zone redundancy %s as layout version %d", want, version))
+	logf.FromContext(ctx).Info("Applied zone redundancy", "redundancy", want.String(), "version", version)
+	return nil
+}
+
 // reconcileDestructiveLayout handles a plan that drains one or more nodes. It enforces the
 // safety guardrails, previews the change, and gates the apply behind the approval annotation.
 func (r *GarageClusterReconciler) reconcileDestructiveLayout(ctx context.Context, cluster *garagev1alpha1.GarageCluster, status *garagev1alpha1.GarageClusterStatus, layoutClient clusterAdmin, desired []nodeEndpoint, plan *garageadmin.LayoutPlan) error {

@@ -134,8 +134,9 @@ spec:
                 type: string
               nodePools:
                 description: |-
-                  nodePools defines one or more pools of Garage nodes. Each pool becomes a StatefulSet
-                  and maps to a single Garage zone.
+                  nodePools defines one or more pools of Garage nodes. Each pool becomes a StatefulSet.
+                  A pool maps to a single Garage zone unless it sets zoneFrom, which derives a per-node
+                  zone from the Node each pod runs on.
                 items:
                   description: |-
                     NodePool is a set of identically-configured Garage nodes backed by one StatefulSet.
@@ -1224,8 +1225,17 @@ spec:
                         type: object
                       type: array
                     zone:
-                      description: zone is the Garage layout zone for this pool. Defaults
-                        to the pool name if omitted.
+                      description: |-
+                        zone is the Garage layout zone for this pool. Defaults to the pool name if omitted.
+                        Ignored when zoneFrom is set.
+                      type: string
+                    zoneFrom:
+                      description: |-
+                        zoneFrom derives each node's Garage zone from this label on the Kubernetes Node the
+                        pod is scheduled on, letting one pool spread its replicas across failure domains. When
+                        set it takes precedence over zone, and the operator spreads the pool's pods across the
+                        label's values (a default topology-spread constraint). Every Node a pod lands on must
+                        carry the label, or that node defers until it does.
                       type: string
                   required:
                   - name
@@ -1315,6 +1325,26 @@ spec:
                         description: type is the Kubernetes Service type for the endpoint.
                         type: string
                     type: object
+                type: object
+              zoneRedundancy:
+                description: |-
+                  zoneRedundancy controls how many distinct zones each partition replicates across
+                  (cross-zone replication). Defaults to Maximum.
+                properties:
+                  atLeast:
+                    description: |-
+                      atLeast is the minimum number of distinct zones each partition must span. Required when
+                      mode is AtLeast; ignored otherwise. Must not exceed the number of zones in the layout.
+                    minimum: 1
+                    type: integer
+                  mode:
+                    default: Maximum
+                    description: mode is Maximum (spread across as many zones as possible)
+                      or AtLeast.
+                    enum:
+                    - Maximum
+                    - AtLeast
+                    type: string
                 type: object
             required:
             - nodePools

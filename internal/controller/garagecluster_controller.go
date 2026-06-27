@@ -80,6 +80,8 @@ type clusterAdmin interface {
 	PreviewStagedChanges(ctx context.Context) ([]string, error)
 	ApplyLayout(ctx context.Context, version int64) error
 	RevertStagedChanges(ctx context.Context) error
+	CurrentZoneRedundancy(ctx context.Context) (garageadmin.ZoneRedundancyValue, error)
+	SetZoneRedundancy(ctx context.Context, desired garageadmin.ZoneRedundancyValue) (int64, error)
 	AppliedLayoutNodeIDs(ctx context.Context) ([]string, error)
 	RemoveNode(ctx context.Context, nodeID string) error
 	AddNode(ctx context.Context, role garageadmin.DesiredRole) error
@@ -113,6 +115,7 @@ func defaultAdminClientFactory(baseURL, token string) (clusterAdmin, error) {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services;configmaps;secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
@@ -185,9 +188,13 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	desired, layoutClient, err := r.discoverNodes(ctx, &cluster, adminToken)
 	if err != nil {
-		log.Info("Waiting for Garage admin API to become reachable", "reason", err.Error())
-		setCondition(status, conditionPeersConnected, metav1.ConditionFalse, "NodesNotReachable", "Waiting for Garage admin API")
-		setCondition(status, conditionReady, metav1.ConditionFalse, "NodesNotReachable", "Garage nodes are not reachable yet")
+		// discoverNodes defers on two distinct causes — a node's admin API not yet reachable, or
+		// a zoneFrom zone that cannot be resolved (pod unscheduled / Node missing the label). Both
+		// are "not ready yet" (requeue), but they need different fixes, so surface the underlying
+		// message rather than a single generic "not reachable" that would misdirect debugging.
+		log.Info("Waiting for Garage nodes to become discoverable", "reason", err.Error())
+		setCondition(status, conditionPeersConnected, metav1.ConditionFalse, "NodesNotReady", err.Error())
+		setCondition(status, conditionReady, metav1.ConditionFalse, "NodesNotReady", err.Error())
 		return r.finish(ctx, &cluster, status, ctrl.Result{RequeueAfter: workloadRequeue})
 	}
 	// Form the RPC mesh before applying layout: UpdateClusterLayout can only assign roles to
@@ -226,6 +233,11 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if err := r.reconcileLayout(ctx, &cluster, status, layoutClient, desired); err != nil {
 		setCondition(status, conditionReady, metav1.ConditionFalse, "LayoutError", err.Error())
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileZoneRedundancy(ctx, &cluster, status, layoutClient, desired); err != nil {
+		setCondition(status, conditionReady, metav1.ConditionFalse, "ZoneRedundancyError", err.Error())
 		return ctrl.Result{}, err
 	}
 
@@ -414,12 +426,12 @@ func (r *GarageClusterReconciler) discoverNodes(ctx context.Context, cluster *ga
 
 	for i := range cluster.Spec.NodePools {
 		pool := &cluster.Spec.NodePools[i]
-		zone := pool.Zone
-		if zone == "" {
-			zone = pool.Name
-		}
 		for ordinal := int32(0); ordinal < pool.Replicas; ordinal++ {
 			podName := fmt.Sprintf("%s-%d", statefulSetName(cluster, pool), ordinal)
+			zone, err := r.resolveZone(ctx, cluster, pool, podName)
+			if err != nil {
+				return nil, nil, err
+			}
 			baseURL := fmt.Sprintf("http://%s.%s.%s.svc:%d", podName, headlessServiceName(cluster), cluster.Namespace, portAdmin)
 			admin, err := r.NewAdminClient(baseURL, token)
 			if err != nil {
@@ -444,6 +456,37 @@ func (r *GarageClusterReconciler) discoverNodes(ctx context.Context, cluster *ga
 		return nil, nil, fmt.Errorf("no nodes discovered")
 	}
 	return nodes, layoutClient, nil
+}
+
+// resolveZone determines the Garage layout zone for a single pod. Precedence (PLAN §4.1):
+// zoneFrom (a label read off the Kubernetes Node the pod is scheduled on) takes priority,
+// then a static zone, then the pool name. With zoneFrom set, an unscheduled pod or a Node
+// missing the label returns an error so discoverNodes defers (requeue) rather than laying
+// the node out under the wrong zone.
+func (r *GarageClusterReconciler) resolveZone(ctx context.Context, cluster *garagev1alpha1.GarageCluster, pool *garagev1alpha1.NodePool, podName string) (string, error) {
+	if pool.ZoneFrom == "" {
+		if pool.Zone != "" {
+			return pool.Zone, nil
+		}
+		return pool.Name, nil
+	}
+
+	var pod corev1.Pod
+	if err := r.Get(ctx, client.ObjectKey{Name: podName, Namespace: cluster.Namespace}, &pod); err != nil {
+		return "", fmt.Errorf("node %s: reading pod for zoneFrom: %w", podName, err)
+	}
+	if pod.Spec.NodeName == "" {
+		return "", fmt.Errorf("node %s: pod not scheduled yet", podName)
+	}
+	var node corev1.Node
+	if err := r.Get(ctx, client.ObjectKey{Name: pod.Spec.NodeName}, &node); err != nil {
+		return "", fmt.Errorf("node %s: reading Node %q for zoneFrom: %w", podName, pod.Spec.NodeName, err)
+	}
+	zone, ok := node.Labels[pool.ZoneFrom]
+	if !ok || zone == "" {
+		return "", fmt.Errorf("node %s: Node %q has no value for zoneFrom label %q", podName, pod.Spec.NodeName, pool.ZoneFrom)
+	}
+	return zone, nil
 }
 
 func (r *GarageClusterReconciler) adminTokenValue(ctx context.Context, cluster *garagev1alpha1.GarageCluster) (string, error) {

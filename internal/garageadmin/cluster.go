@@ -256,6 +256,96 @@ func (c *AdminClient) EnsureLayout(ctx context.Context, desired []DesiredRole) (
 	return true, plan.TargetVersion, nil
 }
 
+// ZoneRedundancyValue is the operator-facing form of a layout's zone-redundancy parameter,
+// flattening Garage's union (the string "maximum" or an {atLeast: N} object) into one struct.
+// Maximum and AtLeast are mutually exclusive: Maximum true means "as many zones as possible";
+// otherwise AtLeast is the minimum number of distinct zones each partition must span.
+type ZoneRedundancyValue struct {
+	Maximum bool
+	AtLeast int
+}
+
+// Equal reports whether two zone-redundancy values request the same replication.
+func (v ZoneRedundancyValue) Equal(other ZoneRedundancyValue) bool {
+	if v.Maximum || other.Maximum {
+		return v.Maximum == other.Maximum
+	}
+	return v.AtLeast == other.AtLeast
+}
+
+// String renders the value for status messages and events.
+func (v ZoneRedundancyValue) String() string {
+	if v.Maximum {
+		return "maximum"
+	}
+	return fmt.Sprintf("atLeast %d", v.AtLeast)
+}
+
+// toAPI converts to Garage's ZoneRedundancy union for an UpdateClusterLayout request.
+func (v ZoneRedundancyValue) toAPI() (ZoneRedundancy, error) {
+	var zr ZoneRedundancy
+	if v.Maximum {
+		return zr, zr.FromZoneRedundancy1(Maximum)
+	}
+	return zr, zr.FromZoneRedundancy0(ZoneRedundancy0{AtLeast: v.AtLeast})
+}
+
+// zoneRedundancyFromAPI flattens Garage's ZoneRedundancy union into a ZoneRedundancyValue.
+// The string variant ("maximum") is tried first; the object variant carries atLeast.
+func zoneRedundancyFromAPI(zr ZoneRedundancy) (ZoneRedundancyValue, error) {
+	if s, err := zr.AsZoneRedundancy1(); err == nil && s == Maximum {
+		return ZoneRedundancyValue{Maximum: true}, nil
+	}
+	if obj, err := zr.AsZoneRedundancy0(); err == nil {
+		return ZoneRedundancyValue{AtLeast: obj.AtLeast}, nil
+	}
+	return ZoneRedundancyValue{}, fmt.Errorf("ZoneRedundancy: unrecognized variant")
+}
+
+// CurrentZoneRedundancy reads the zone-redundancy parameter of the currently-applied layout.
+func (c *AdminClient) CurrentZoneRedundancy(ctx context.Context) (ZoneRedundancyValue, error) {
+	layout, err := c.appliedLayout(ctx)
+	if err != nil {
+		return ZoneRedundancyValue{}, err
+	}
+	return zoneRedundancyFromAPI(layout.Parameters.ZoneRedundancy)
+}
+
+// SetZoneRedundancy stages the desired zone-redundancy parameter and applies it as the next
+// layout version, returning that version. Like applySingleRoleChange it first discards any
+// leftover staged changes so a crashed prior attempt cannot ride along, then reads the applied
+// version for the concurrency-guard target. Garage rebalances data to satisfy the new
+// redundancy on apply.
+func (c *AdminClient) SetZoneRedundancy(ctx context.Context, desired ZoneRedundancyValue) (int64, error) {
+	if err := c.RevertStagedChanges(ctx); err != nil {
+		return 0, err
+	}
+	version, err := c.appliedLayoutVersion(ctx)
+	if err != nil {
+		return 0, err
+	}
+	zr, err := desired.toAPI()
+	if err != nil {
+		return 0, err
+	}
+	var params UpdateClusterLayoutRequest_Parameters
+	if err := params.FromLayoutParameters(LayoutParameters{ZoneRedundancy: zr}); err != nil {
+		return 0, err
+	}
+	resp, err := c.UpdateClusterLayoutWithResponse(ctx, UpdateClusterLayoutRequest{Parameters: &params})
+	if err != nil {
+		return 0, err
+	}
+	if resp.JSON200 == nil {
+		return 0, fmt.Errorf("UpdateClusterLayout (parameters): unexpected status %s", resp.Status())
+	}
+	target := version + 1
+	if err := c.ApplyLayout(ctx, target); err != nil {
+		return 0, err
+	}
+	return target, nil
+}
+
 // RemoveNode drains a single node out of the cluster layout: it stages the node's removal
 // and applies it as the next layout version, after which Garage redistributes the node's
 // data to the remaining replicas. Used by the storage-migration flow (PLAN.md §4.5) to

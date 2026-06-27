@@ -186,6 +186,32 @@ var _ = Describe("GarageCluster resource builders", func() {
 		})
 	})
 
+	Describe("topology spread (zoneFrom)", func() {
+		It("injects no spread constraint when zoneFrom is unset", func() {
+			ss := desiredStatefulSet(cluster, &cluster.Spec.NodePools[0])
+			Expect(ss.Spec.Template.Spec.TopologySpreadConstraints).To(BeEmpty())
+		})
+
+		It("spreads the pool's pods across the zoneFrom label when set", func() {
+			cluster.Spec.NodePools[0].ZoneFrom = "topology.kubernetes.io/zone"
+			ss := desiredStatefulSet(cluster, &cluster.Spec.NodePools[0])
+
+			cons := ss.Spec.Template.Spec.TopologySpreadConstraints
+			Expect(cons).To(HaveLen(1))
+			Expect(cons[0].TopologyKey).To(Equal("topology.kubernetes.io/zone"))
+			Expect(cons[0].MaxSkew).To(Equal(int32(1)))
+			Expect(cons[0].WhenUnsatisfiable).To(Equal(corev1.DoNotSchedule))
+			Expect(cons[0].LabelSelector.MatchLabels).To(HaveKeyWithValue(labelPool, "default"))
+		})
+
+		It("defers to the user's affinity instead of injecting a default spread", func() {
+			cluster.Spec.NodePools[0].ZoneFrom = "topology.kubernetes.io/zone"
+			cluster.Spec.NodePools[0].Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{}}
+			ss := desiredStatefulSet(cluster, &cluster.Spec.NodePools[0])
+			Expect(ss.Spec.Template.Spec.TopologySpreadConstraints).To(BeEmpty())
+		})
+	})
+
 	Describe("config hash annotation", func() {
 		It("stamps the pod template with a config-hash annotation", func() {
 			ss := desiredStatefulSet(cluster, &cluster.Spec.NodePools[0])
