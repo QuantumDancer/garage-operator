@@ -111,7 +111,7 @@ var _ = Describe("GarageBucket integration", Ordered, func() {
 				Lifecycle: []garagev1alpha1.LifecycleRule{{
 					ID:                             "expire-tmp",
 					Status:                         garagev1alpha1.LifecycleRuleEnabled,
-					Filter:                         &garagev1alpha1.LifecycleFilter{Prefix: "tmp/"},
+					Filter:                         &garagev1alpha1.LifecycleFilter{Prefix: testLifecyclePrefix},
 					Expiration:                     &garagev1alpha1.LifecycleExpiration{Days: ptr.To(int32(30))},
 					AbortIncompleteMultipartUpload: &garagev1alpha1.AbortIncompleteMultipartUpload{DaysAfterInitiation: 7},
 				}},

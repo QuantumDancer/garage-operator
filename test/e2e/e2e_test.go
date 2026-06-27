@@ -1287,6 +1287,79 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", ns))
 		})
 
+		// The deployed CRDs carry CEL (x-kubernetes-validations) rules instead of an admission
+		// webhook. A server-side dry-run exercises those rules in the real API server without
+		// persisting anything or needing a running Garage cluster, proving the packaged CRDs
+		// reject invalid specs end-to-end. (Field-by-field coverage lives in the envtest suite.)
+		It("should reject invalid CRs via the CRD validation rules", Label("validation"), func() {
+			applyDryRun := func(kind, manifest string) error {
+				manifestFile := filepath.Join("/tmp", "garage-validation-"+kind+".yaml")
+				Expect(os.WriteFile(manifestFile, []byte(manifest), os.FileMode(0o644))).To(Succeed())
+				_, err := utils.Run(exec.Command("kubectl", "apply", "--dry-run=server", "-f", manifestFile))
+				return err
+			}
+
+			By("rejecting a GarageCluster whose adminToken is Provided without a secretRef")
+			err := applyDryRun("cluster", fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: invalid-cluster
+  namespace: %s
+spec:
+  nodePools:
+    - name: default
+      replicas: 1
+      storage:
+        data: { size: 1Gi }
+        meta: { size: 1Gi }
+  adminToken:
+    mode: Provided
+`, namespace))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("secretRef is required when mode is Provided"))
+
+			By("rejecting a GarageBucket with duplicate globalAliases")
+			err = applyDryRun("bucket", fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageBucket
+metadata:
+  name: invalid-bucket
+  namespace: %s
+spec:
+  clusterRef:
+    name: some-cluster
+  globalAliases: [dup, dup]
+`, namespace))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("Duplicate value"))
+
+			By("rejecting a GarageKey with renewBefore but no expiration")
+			err = applyDryRun("key", fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageKey
+metadata:
+  name: invalid-key
+  namespace: %s
+spec:
+  clusterRef:
+    name: some-cluster
+  renewBefore: 168h
+`, namespace))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("renewBefore requires expiration"))
+
+			By("accepting a valid GarageBucket")
+			err = applyDryRun("valid-bucket", fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageBucket
+metadata:
+  name: valid-bucket
+  namespace: %s
+spec:
+  clusterRef:
+    name: some-cluster
+  globalAliases: [photos, images]
+`, namespace))
+			Expect(err).NotTo(HaveOccurred(), "a valid GarageBucket should pass validation")
+		})
+
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 
 		// TODO: Customize the e2e test suite with scenarios specific to your project.

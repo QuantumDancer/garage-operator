@@ -66,6 +66,7 @@ const (
 )
 
 // GarageKeySpec defines the desired state of GarageKey.
+// +kubebuilder:validation:XValidation:rule="!has(self.renewBefore) || has(self.expiration)",message="renewBefore requires expiration to be set"
 type GarageKeySpec struct {
 	// clusterRef selects the GarageCluster the key belongs to.
 	// +kubebuilder:validation:Required

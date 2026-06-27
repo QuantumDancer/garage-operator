@@ -133,6 +133,9 @@ spec:
             required:
             - clusterRef
             type: object
+            x-kubernetes-validations:
+            - message: renewBefore requires expiration to be set
+              rule: '!has(self.renewBefore) || has(self.expiration)'
           status:
             description: status defines the observed state of GarageKey
             properties:

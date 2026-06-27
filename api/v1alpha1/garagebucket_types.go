@@ -115,6 +115,7 @@ const (
 
 // LifecycleFilter narrows which objects a lifecycle rule applies to. All set conditions
 // must match (logical AND).
+// +kubebuilder:validation:XValidation:rule="!has(self.objectSizeGreaterThan) || !has(self.objectSizeLessThan) || self.objectSizeGreaterThan < self.objectSizeLessThan",message="objectSizeGreaterThan must be less than objectSizeLessThan"
 type LifecycleFilter struct {
 	// prefix matches object keys beginning with this string.
 	// +optional
@@ -133,6 +134,7 @@ type LifecycleFilter struct {
 
 // LifecycleExpiration expires matching objects either after a number of days or on an
 // absolute date. Set exactly one of days or date.
+// +kubebuilder:validation:XValidation:rule="has(self.days) != (has(self.date) && size(self.date) > 0)",message="expiration must set exactly one of days or date"
 type LifecycleExpiration struct {
 	// days expires objects this many days after creation.
 	// +kubebuilder:validation:Minimum=1
@@ -153,6 +155,7 @@ type AbortIncompleteMultipartUpload struct {
 }
 
 // LifecycleRule is one object-lifecycle rule on the bucket.
+// +kubebuilder:validation:XValidation:rule="has(self.expiration) || has(self.abortIncompleteMultipartUpload)",message="a lifecycle rule must set expiration or abortIncompleteMultipartUpload"
 type LifecycleRule struct {
 	// id optionally identifies the rule.
 	// +optional
@@ -230,7 +233,9 @@ type GarageBucketSpec struct {
 	ClusterRef ClusterReference `json:"clusterRef"`
 
 	// globalAliases are cluster-wide unique aliases for the bucket. Empty means the bucket
-	// has no global alias and is addressable only by its id.
+	// has no global alias and is addressable only by its id. Aliases must be unique within
+	// this bucket; cluster-wide uniqueness is enforced by Garage and surfaced via status.
+	// +listType=set
 	// +optional
 	GlobalAliases []string `json:"globalAliases,omitempty"`
 

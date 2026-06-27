@@ -127,10 +127,12 @@ spec:
               globalAliases:
                 description: |-
                   globalAliases are cluster-wide unique aliases for the bucket. Empty means the bucket
-                  has no global alias and is addressable only by its id.
+                  has no global alias and is addressable only by its id. Aliases must be unique within
+                  this bucket; cluster-wide uniqueness is enforced by Garage and surfaced via status.
                 items:
                   type: string
                 type: array
+                x-kubernetes-list-type: set
               grants:
                 description: grants grant GarageKeys permissions on the bucket. Reconciled
                   in Phase 3 (see BucketGrant).
@@ -201,6 +203,10 @@ spec:
                           minimum: 1
                           type: integer
                       type: object
+                      x-kubernetes-validations:
+                      - message: expiration must set exactly one of days or date
+                        rule: has(self.days) != (has(self.date) && size(self.date)
+                          > 0)
                     filter:
                       description: filter narrows which objects the rule applies to;
                         omitted means the whole bucket.
@@ -222,6 +228,10 @@ spec:
                             string.
                           type: string
                       type: object
+                      x-kubernetes-validations:
+                      - message: objectSizeGreaterThan must be less than objectSizeLessThan
+                        rule: '!has(self.objectSizeGreaterThan) || !has(self.objectSizeLessThan)
+                          || self.objectSizeGreaterThan < self.objectSizeLessThan'
                     id:
                       description: id optionally identifies the rule.
                       type: string
@@ -234,6 +244,9 @@ spec:
                   required:
                   - status
                   type: object
+                  x-kubernetes-validations:
+                  - message: a lifecycle rule must set expiration or abortIncompleteMultipartUpload
+                    rule: has(self.expiration) || has(self.abortIncompleteMultipartUpload)
                 type: array
               localAliases:
                 description: localAliases are per-key aliases. Reconciled in Phase

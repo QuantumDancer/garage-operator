@@ -27,7 +27,7 @@ jobs:
       matrix:
         include:
           - shard: light
-            filter: "manager || bucket || key || maintenance"
+            filter: "manager || bucket || key || maintenance || validation"
           - shard: cluster
             filter: "cluster || class"
           - shard: drain
