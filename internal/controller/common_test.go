@@ -29,6 +29,9 @@ const (
 	testKeyNS       = "media"
 	testGarageKeyID = "GK-1"
 
+	// testLifecyclePrefix is the object-key prefix reused by lifecycle-rule fixtures.
+	testLifecyclePrefix = "tmp/"
+
 	// reasonClusterReady is the condition reason the test fixtures stamp on a Ready cluster.
 	reasonClusterReady = "ClusterReady"
 )

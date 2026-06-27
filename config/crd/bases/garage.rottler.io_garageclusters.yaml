@@ -78,6 +78,9 @@ spec:
                     - name
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: secretRef is required when mode is Provided
+                  rule: '!has(self.mode) || self.mode != ''Provided'' || has(self.secretRef)'
               blockSize:
                 default: 1048576
                 description: |-
@@ -106,13 +109,17 @@ spec:
               dbEngine:
                 default: lmdb
                 description: |-
-                  dbEngine selects the metadata database engine.
+                  dbEngine selects the metadata database engine. Immutable once set: the Admin API
+                  exposes no way to convert a live cluster's engine, so changing it is rejected.
                   https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/#db_engine
                 enum:
                 - lmdb
                 - sqlite
                 - fjall
                 type: string
+                x-kubernetes-validations:
+                - message: dbEngine is immutable
+                  rule: self == oldSelf
               image:
                 description: image selects the Garage container image.
                 properties:
@@ -1250,12 +1257,15 @@ spec:
               replicationFactor:
                 default: 3
                 description: |-
-                  replicationFactor is the Garage replication_factor. Immutable on a live cluster
-                  (enforced by webhook in a later phase); changing it risks data loss.
+                  replicationFactor is the Garage replication_factor. Immutable once set; changing it on
+                  a live cluster risks data loss, so it is rejected.
                   https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/#replication_factor
                 format: int32
                 minimum: 1
                 type: integer
+                x-kubernetes-validations:
+                - message: replicationFactor is immutable
+                  rule: self == oldSelf
               rpcSecret:
                 description: rpcSecret configures the inter-node RPC secret bootstrap.
                 properties:
@@ -1282,6 +1292,9 @@ spec:
                     - name
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: secretRef is required when mode is Provided
+                  rule: '!has(self.mode) || self.mode != ''Provided'' || has(self.secretRef)'
               s3:
                 description: s3 configures the S3 API and website settings.
                 properties:
@@ -1346,6 +1359,10 @@ spec:
                     - AtLeast
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: atLeast must be set (>= 1) when mode is AtLeast
+                  rule: '!has(self.mode) || self.mode != ''AtLeast'' || (has(self.atLeast)
+                    && self.atLeast >= 1)'
             required:
             - nodePools
             type: object

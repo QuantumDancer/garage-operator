@@ -60,6 +60,7 @@ type SecretKeySelector struct {
 }
 
 // SecretBootstrap describes how a sensitive value (admin token, RPC secret) is sourced.
+// +kubebuilder:validation:XValidation:rule="!has(self.mode) || self.mode != 'Provided' || has(self.secretRef)",message="secretRef is required when mode is Provided"
 type SecretBootstrap struct {
 	// mode selects Generate (operator-managed) or Provided (user-supplied via secretRef).
 	// +kubebuilder:default=Generate
@@ -213,6 +214,7 @@ const (
 )
 
 // ZoneRedundancy controls how many distinct zones each data partition is replicated across.
+// +kubebuilder:validation:XValidation:rule="!has(self.mode) || self.mode != 'AtLeast' || (has(self.atLeast) && self.atLeast >= 1)",message="atLeast must be set (>= 1) when mode is AtLeast"
 type ZoneRedundancy struct {
 	// mode is Maximum (spread across as many zones as possible) or AtLeast.
 	// +kubebuilder:default=Maximum
@@ -232,9 +234,11 @@ type GarageClusterSpec struct {
 	// +optional
 	Image GarageImage `json:"image,omitempty"`
 
-	// dbEngine selects the metadata database engine.
+	// dbEngine selects the metadata database engine. Immutable once set: the Admin API
+	// exposes no way to convert a live cluster's engine, so changing it is rejected.
 	// https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/#db_engine
 	// +kubebuilder:default=lmdb
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="dbEngine is immutable"
 	// +optional
 	DBEngine GarageDBEngine `json:"dbEngine,omitempty"`
 
@@ -245,11 +249,12 @@ type GarageClusterSpec struct {
 	// +optional
 	BlockSize int64 `json:"blockSize,omitempty"`
 
-	// replicationFactor is the Garage replication_factor. Immutable on a live cluster
-	// (enforced by webhook in a later phase); changing it risks data loss.
+	// replicationFactor is the Garage replication_factor. Immutable once set; changing it on
+	// a live cluster risks data loss, so it is rejected.
 	// https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/#replication_factor
 	// +kubebuilder:default=3
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="replicationFactor is immutable"
 	// +optional
 	ReplicationFactor int32 `json:"replicationFactor,omitempty"`
 
