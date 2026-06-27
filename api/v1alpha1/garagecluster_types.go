@@ -316,6 +316,58 @@ type EndpointsStatus struct {
 	Web string `json:"web,omitempty"`
 }
 
+// SnapshotStatus reports the outcome of the most recent operator-triggered metadata snapshot.
+type SnapshotStatus struct {
+	// observedTrigger is the garage.rottler.io/snapshot annotation value last acted on.
+	// A snapshot runs once when this value changes; bumping it requests another.
+	ObservedTrigger string `json:"observedTrigger"`
+
+	// time is when the snapshot was requested.
+	Time metav1.Time `json:"time"`
+
+	// result is Succeeded, Partial (some nodes failed), or Failed (all nodes failed).
+	Result string `json:"result"`
+
+	// message summarizes the per-node outcome.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// RepairStatus reports the most recent operator-triggered repair operation.
+type RepairStatus struct {
+	// observedTrigger is the garage.rottler.io/repair annotation value last acted on.
+	// A repair launches once when this value changes; bumping it (e.g. "blocks@2") relaunches.
+	ObservedTrigger string `json:"observedTrigger"`
+
+	// type is the repair type that was launched.
+	Type string `json:"type"`
+
+	// time is when the repair was launched.
+	Time metav1.Time `json:"time"`
+
+	// state is Launched, Running, Done, or Failed. Running/Done are best-effort, derived from
+	// Garage's background-worker activity, which may reflect unrelated maintenance.
+	State string `json:"state"`
+
+	// progress is a free-form summary of the active background workers, while any are running.
+	// +optional
+	Progress string `json:"progress,omitempty"`
+}
+
+// MaintenanceStatus records the most recent operator-triggered day-2 maintenance actions
+// (metadata snapshot, repair). Both are one-shot actions requested via annotations; this block
+// reports their outcome and tracks the trigger value last acted on so a repeated value is not
+// re-run.
+type MaintenanceStatus struct {
+	// snapshot reports the most recent metadata-snapshot request.
+	// +optional
+	Snapshot *SnapshotStatus `json:"snapshot,omitempty"`
+
+	// repair reports the most recent repair operation.
+	// +optional
+	Repair *RepairStatus `json:"repair,omitempty"`
+}
+
 // GarageClusterStatus defines the observed state of GarageCluster.
 type GarageClusterStatus struct {
 	// conditions represent the current state of the GarageCluster resource.
@@ -340,6 +392,10 @@ type GarageClusterStatus struct {
 	// endpoints reports the resolved client-facing endpoints.
 	// +optional
 	Endpoints *EndpointsStatus `json:"endpoints,omitempty"`
+
+	// maintenance reports operator-triggered metadata snapshot and repair operations.
+	// +optional
+	Maintenance *MaintenanceStatus `json:"maintenance,omitempty"`
 
 	// adminTokenSecret names the Secret holding the Admin API token.
 	// +optional
