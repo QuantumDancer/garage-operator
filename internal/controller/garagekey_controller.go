@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -37,6 +38,7 @@ import (
 
 	garagev1alpha1 "github.com/QuantumDancer/garage-operator/api/v1alpha1"
 	"github.com/QuantumDancer/garage-operator/internal/garageadmin"
+	"github.com/QuantumDancer/garage-operator/internal/refpolicy"
 )
 
 // keyFinalizer guards the Garage key against the CR vanishing before the operator has honoured
@@ -71,6 +73,10 @@ type GarageKeyReconciler struct {
 	// NewAdminClient builds an admin client for a cluster's endpoint. Defaulted to the real
 	// Garage Admin API client; overridden in tests.
 	NewAdminClient func(baseURL, token string) (keyAdmin, error)
+
+	// Recorder emits Events onto the CR (e.g. why a reference was denied) so the reason is
+	// visible in `kubectl describe`, not just in a status condition.
+	Recorder record.EventRecorder
 }
 
 func defaultKeyAdminFactory(baseURL, token string) (keyAdmin, error) {
@@ -82,6 +88,8 @@ func defaultKeyAdminFactory(baseURL, token string) (keyAdmin, error) {
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garagekeys/finalizers,verbs=update
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garageclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 // Reconcile drives a Garage access key toward the GarageKey spec: it resolves the referenced
 // cluster's Admin API, creates or imports the key, publishes its credentials into a Secret, and
@@ -112,6 +120,20 @@ func (r *GarageKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	status := key.Status.DeepCopy()
 	status.ObservedGeneration = key.Generation
+
+	// Hard backstop for the cluster's referencePolicy (see the bucket controller): a denied
+	// reference never reaches the Admin API. The key re-reconciles on cluster changes via the
+	// GarageCluster watch, so no requeue is needed.
+	allowed, reason, err := refpolicy.Check(ctx, r.Client, key.Spec.ClusterRef, key.Namespace)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !allowed {
+		log.Info("Reference not permitted by cluster referencePolicy", "reason", reason)
+		setKeyCondition(status, conditionReady, metav1.ConditionFalse, reasonReferenceNotAllowed, reason)
+		r.Recorder.Event(&key, corev1.EventTypeWarning, reasonReferenceNotAllowed, reason)
+		return r.finish(ctx, &key, status, ctrl.Result{})
+	}
 
 	conn, state, err := resolveClusterConnection(ctx, r.Client, key.Spec.ClusterRef, key.Namespace)
 	if err != nil {

@@ -334,6 +334,27 @@ func TestBucketReconcilePendingWhenClusterNotReady(t *testing.T) {
 	}
 }
 
+// TestBucketReconcileDeniedByReferencePolicy is the controller backstop for the cluster's
+// referencePolicy: a bucket whose namespace the policy forbids must report
+// ReferenceNotAllowed and never touch the Admin API, even though the cluster is Ready.
+func TestBucketReconcileDeniedByReferencePolicy(t *testing.T) {
+	cluster, secret := readyCluster()
+	// testBucketNS ("media") is not in the allow-list and the cluster lives in "storage".
+	cluster.Spec.ReferencePolicy = &garagev1alpha1.ReferencePolicy{AllowedNamespaces: []string{"other"}}
+	admin := newFakeBucketAdmin()
+	r, c := newBucketReconciler(t, admin, bucketCR(true, garagev1alpha1.GarageBucketSpec{}), cluster, secret)
+
+	reconcileBucket(t, r)
+
+	cond := meta.FindStatusCondition(getBucket(t, c).Status.Conditions, conditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != reasonReferenceNotAllowed {
+		t.Fatalf("Ready condition = %+v, want False/ReferenceNotAllowed", cond)
+	}
+	if admin.createCalls != 0 {
+		t.Errorf("createCalls = %d, want 0 for a denied reference", admin.createCalls)
+	}
+}
+
 func TestBucketReconcileCreatesBucket(t *testing.T) {
 	cluster, secret := readyCluster()
 	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{GlobalAliases: []string{testBucketName}})

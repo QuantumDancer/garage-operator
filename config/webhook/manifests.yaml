@@ -1,0 +1,46 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-garage-rottler-io-v1alpha1-garagebucket
+  failurePolicy: Ignore
+  name: vgaragebucket-v1alpha1.kb.io
+  rules:
+  - apiGroups:
+    - garage.rottler.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - garagebuckets
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-garage-rottler-io-v1alpha1-garagekey
+  failurePolicy: Ignore
+  name: vgaragekey-v1alpha1.kb.io
+  rules:
+  - apiGroups:
+    - garage.rottler.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - garagekeys
+  sideEffects: None

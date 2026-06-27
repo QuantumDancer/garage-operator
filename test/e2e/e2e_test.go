@@ -239,6 +239,31 @@ var _ = Describe("Manager", Ordered, ContinueOnFailure, func() {
 			}
 			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
 
+			By("waiting for the webhook service endpoints to be ready")
+			verifyWebhookEndpointsReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "endpointslices.discovery.k8s.io", "-n", namespace,
+					"-l", "kubernetes.io/service-name=garage-operator-webhook-service",
+					"-o", "jsonpath={range .items[*]}{range .endpoints[*]}{.addresses[*]}{end}{end}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Webhook endpoints should exist")
+				g.Expect(output).ShouldNot(BeEmpty(), "Webhook endpoints not yet ready")
+			}
+			Eventually(verifyWebhookEndpointsReady, 3*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying the validating webhook server is ready")
+			verifyValidatingWebhookReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "validatingwebhookconfigurations.admissionregistration.k8s.io",
+					"garage-operator-validating-webhook-configuration",
+					"-o", "jsonpath={.webhooks[0].clientConfig.caBundle}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "ValidatingWebhookConfiguration should exist")
+				g.Expect(output).ShouldNot(BeEmpty(), "Validating webhook CA bundle not yet injected")
+			}
+			Eventually(verifyValidatingWebhookReady, 3*time.Minute, time.Second).Should(Succeed())
+
+			By("waiting additional time for webhook server to stabilize")
+			time.Sleep(5 * time.Second)
+
 			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
 
 			By("waiting for the metrics service to have ready endpoints")
@@ -1358,6 +1383,121 @@ spec:
   globalAliases: [photos, images]
 `, namespace))
 			Expect(err).NotTo(HaveOccurred(), "a valid GarageBucket should pass validation")
+		})
+
+		// The cross-namespace referencePolicy is enforced by the validating admission webhook
+		// (reader-backed: it loads the referenced GarageCluster). A server-side dry-run drives the
+		// real webhook end-to-end without persisting buckets/keys. The cluster CR must exist for
+		// the webhook to read its policy, so we create it and wait until the webhook's cache sees
+		// it (the forbidden reference is rejected) before asserting the allowed cases.
+		It("should enforce a GarageCluster referencePolicy on bucket/key references", Label("validation"), func() {
+			const (
+				policyClusterNS = "garage-refpolicy-e2e"
+				allowedNS       = "garage-refpolicy-allowed"
+				forbiddenNS     = "garage-refpolicy-forbidden"
+				policyCluster   = "refpolicy-cluster"
+			)
+			for _, ns := range []string{policyClusterNS, allowedNS, forbiddenNS} {
+				_, _ = utils.Run(exec.Command("kubectl", "create", "ns", ns))
+			}
+			DeferCleanup(func() {
+				for _, ns := range []string{policyClusterNS, allowedNS, forbiddenNS} {
+					_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", ns, "--wait=false"))
+				}
+			})
+
+			By("creating a GarageCluster whose referencePolicy allows only one namespace")
+			clusterManifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  nodePools:
+    - name: default
+      replicas: 1
+      storage:
+        data: { size: 1Gi }
+        meta: { size: 1Gi }
+  referencePolicy:
+    allowedNamespaces: [%s]
+`, policyCluster, policyClusterNS, allowedNS)
+			clusterFile := filepath.Join("/tmp", "garage-refpolicy-cluster.yaml")
+			Expect(os.WriteFile(clusterFile, []byte(clusterManifest), os.FileMode(0o644))).To(Succeed())
+			_, err := utils.Run(exec.Command("kubectl", "apply", "-f", clusterFile))
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() { _, _ = utils.Run(exec.Command("kubectl", "delete", "-f", clusterFile, "--wait=false")) })
+
+			bucketDryRun := func(bucketNS string) error {
+				manifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageBucket
+metadata:
+  name: refpolicy-bucket
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+    namespace: %s
+`, bucketNS, policyCluster, policyClusterNS)
+				manifestFile := filepath.Join("/tmp", "garage-refpolicy-bucket-"+bucketNS+".yaml")
+				Expect(os.WriteFile(manifestFile, []byte(manifest), os.FileMode(0o644))).To(Succeed())
+				_, err := utils.Run(exec.Command("kubectl", "apply", "--dry-run=server", "-f", manifestFile))
+				return err
+			}
+
+			By("rejecting a bucket from a forbidden namespace (once the webhook cache sees the cluster)")
+			Eventually(func(g Gomega) {
+				err := bucketDryRun(forbiddenNS)
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring("referencePolicy"))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("admitting a bucket from the allowed namespace")
+			Expect(bucketDryRun(allowedNS)).To(Succeed())
+
+			By("admitting a bucket from the cluster's own namespace")
+			Expect(bucketDryRun(policyClusterNS)).To(Succeed())
+
+			By("rejecting a key from a forbidden namespace")
+			keyManifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageKey
+metadata:
+  name: refpolicy-key
+  namespace: %s
+spec:
+  clusterRef:
+    name: %s
+    namespace: %s
+`, forbiddenNS, policyCluster, policyClusterNS)
+			keyFile := filepath.Join("/tmp", "garage-refpolicy-key.yaml")
+			Expect(os.WriteFile(keyFile, []byte(keyManifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "--dry-run=server", "-f", keyFile))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("referencePolicy"))
+		})
+
+		It("should provisioned cert-manager", Label("validation"), func() {
+			By("validating that cert-manager has the certificate Secret")
+			verifyCertManager := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "secrets", "webhook-server-cert", "-n", namespace)
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+			}
+			Eventually(verifyCertManager).Should(Succeed())
+		})
+
+		It("should have CA injection for validating webhooks", Label("validation"), func() {
+			By("checking CA injection for validating webhooks")
+			verifyCAInjection := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get",
+					"validatingwebhookconfigurations.admissionregistration.k8s.io",
+					"garage-operator-validating-webhook-configuration",
+					"-o", "go-template={{ range .webhooks }}{{ .clientConfig.caBundle }}{{ end }}")
+				vwhOutput, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(len(vwhOutput)).To(BeNumerically(">", 10))
+			}
+			Eventually(verifyCAInjection).Should(Succeed())
 		})
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks

@@ -37,6 +37,7 @@ import (
 
 	garagev1alpha1 "github.com/QuantumDancer/garage-operator/api/v1alpha1"
 	"github.com/QuantumDancer/garage-operator/internal/controller"
+	webhookv1alpha1 "github.com/QuantumDancer/garage-operator/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -198,11 +199,26 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.GarageKeyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("garagekey-controller"), //nolint:staticcheck
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "garagekey")
 		os.Exit(1)
+	}
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupGarageBucketWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "GarageBucket")
+			os.Exit(1)
+		}
+	}
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupGarageKeyWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "GarageKey")
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 
