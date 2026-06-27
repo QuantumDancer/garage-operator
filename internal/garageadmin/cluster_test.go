@@ -442,6 +442,74 @@ func TestStageLayoutChangesNoOpOnEmpty(t *testing.T) {
 	}
 }
 
+func TestRemoveNodeDrainsOneNode(t *testing.T) {
+	fake := &fakeAdmin{
+		t: t,
+		layout: GetClusterLayoutResponse{
+			Version: 9,
+			Roles: []LayoutNodeRole{
+				{Id: nodeID1, Zone: zoneDefault, Capacity: ptrInt64(1 << 40)},
+				{Id: nodeStale, Zone: zoneDefault, Capacity: ptrInt64(1 << 40)},
+			},
+		},
+	}
+	client := newTestClient(t, fake)
+
+	if err := client.RemoveNode(context.Background(), nodeStale); err != nil {
+		t.Fatalf("RemoveNode: %v", err)
+	}
+
+	// Leftover staged changes are discarded before staging exactly this removal, which is
+	// then applied as the next version.
+	if fake.revertCalls != 1 {
+		t.Errorf("revert calls = %d, want 1", fake.revertCalls)
+	}
+	if fake.updateCalls != 1 || fake.applyCalls != 1 {
+		t.Fatalf("update/apply calls = %d/%d, want 1/1", fake.updateCalls, fake.applyCalls)
+	}
+	if got := fake.appliedVersions[0]; got != 10 {
+		t.Errorf("applied version = %d, want 10 (current+1)", got)
+	}
+	staged := *fake.updateBodies[0].Roles
+	if len(staged) != 1 {
+		t.Fatalf("staged changes = %d, want 1", len(staged))
+	}
+	removal, err := staged[0].AsNodeRoleChangeRequest0()
+	if err != nil {
+		t.Fatalf("decode removal: %v", err)
+	}
+	if removal.Id != nodeStale || !removal.Remove {
+		t.Errorf("staged removal = %+v, want id=node-stale remove=true", removal)
+	}
+}
+
+func TestAddNodeAssignsOneRole(t *testing.T) {
+	fake := &fakeAdmin{
+		t:      t,
+		layout: GetClusterLayoutResponse{Version: 2, Roles: []LayoutNodeRole{}},
+	}
+	client := newTestClient(t, fake)
+
+	err := client.AddNode(context.Background(), DesiredRole{NodeID: nodeID1, Zone: zoneDefault, Capacity: 1 << 39})
+	if err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	if fake.revertCalls != 1 || fake.updateCalls != 1 || fake.applyCalls != 1 {
+		t.Fatalf("revert/update/apply = %d/%d/%d, want 1/1/1", fake.revertCalls, fake.updateCalls, fake.applyCalls)
+	}
+	if got := fake.appliedVersions[0]; got != 3 {
+		t.Errorf("applied version = %d, want 3 (current+1)", got)
+	}
+	staged := *fake.updateBodies[0].Roles
+	assign, err := staged[0].AsNodeRoleChangeRequest1()
+	if err != nil {
+		t.Fatalf("decode assignment: %v", err)
+	}
+	if assign.Id != nodeID1 || assign.Capacity == nil || *assign.Capacity != 1<<39 {
+		t.Errorf("staged assignment = %+v, want id=node-1 capacity=2^39", assign)
+	}
+}
+
 func TestEnsureLayoutRestagesOnCapacityChange(t *testing.T) {
 	fake := &fakeAdmin{
 		t: t,

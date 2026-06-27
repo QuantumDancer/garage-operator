@@ -177,7 +177,10 @@ func TestReconcileStorageGrowsEveryReplicaClaim(t *testing.T) {
 	}
 }
 
-func TestReconcileStorageBlocksShrink(t *testing.T) {
+// TestReconcileStorageRoutesShrinkToMigration proves the in-place path leaves a shrink alone:
+// it neither patches the (un-shrinkable) PVC nor recreates the StatefulSet nor sets a
+// condition. The migration step (which has Admin API access to drain the node) owns it.
+func TestReconcileStorageRoutesShrinkToMigration(t *testing.T) {
 	// Spec asks for less than the live StatefulSet provisioned.
 	fx := newStorageFixture("2Gi", "1Gi", "1Gi", 1, true)
 	r, c := newStorageReconciler(t, fx.objs...)
@@ -188,7 +191,7 @@ func TestReconcileStorageBlocksShrink(t *testing.T) {
 		t.Fatalf("reconcileStorage: %v", err)
 	}
 	if recreate {
-		t.Fatal("expected recreate=false for a refused shrink")
+		t.Fatal("expected recreate=false: a shrink is left for the migration step")
 	}
 
 	// The claim and StatefulSet are left untouched.
@@ -199,14 +202,15 @@ func TestReconcileStorageBlocksShrink(t *testing.T) {
 	if err := c.Get(context.Background(), types.NamespacedName{Name: ssName(), Namespace: testClusterNS}, &ss); err != nil {
 		t.Errorf("StatefulSet should still exist: %v", err)
 	}
-
-	cond := meta.FindStatusCondition(status.Conditions, conditionStorageChangePending)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Blocked" {
-		t.Fatalf("expected StorageChangePending=False/Blocked, got %+v", cond)
+	// The in-place path never sets StorageChangePending — that is the migration step's to own.
+	if meta.FindStatusCondition(status.Conditions, conditionStorageChangePending) != nil {
+		t.Error("expected no StorageChangePending condition from the in-place path")
 	}
 }
 
-func TestReconcileStorageBlocksNonExpandableClass(t *testing.T) {
+// TestReconcileStorageRoutesNonExpandableGrowToMigration proves a grow on a StorageClass that
+// forbids expansion is also left for migration rather than grown in place.
+func TestReconcileStorageRoutesNonExpandableGrowToMigration(t *testing.T) {
 	fx := newStorageFixture("1Gi", "2Gi", "1Gi", 1, false)
 	r, c := newStorageReconciler(t, fx.objs...)
 	status := &garagev1alpha1.GarageClusterStatus{}
@@ -216,23 +220,20 @@ func TestReconcileStorageBlocksNonExpandableClass(t *testing.T) {
 		t.Fatalf("reconcileStorage: %v", err)
 	}
 	if recreate {
-		t.Fatal("expected recreate=false when the StorageClass forbids expansion")
+		t.Fatal("expected recreate=false: a non-expandable grow is left for the migration step")
 	}
 	if got := claimSize(t, c, ssName(), volumeNameData, 0); got.Cmp(resource.MustParse("1Gi")) != 0 {
 		t.Errorf("data claim = %s, want 1Gi (unchanged)", got.String())
 	}
-	cond := meta.FindStatusCondition(status.Conditions, conditionStorageChangePending)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "Blocked" {
-		t.Fatalf("expected StorageChangePending=False/Blocked, got %+v", cond)
+	if meta.FindStatusCondition(status.Conditions, conditionStorageChangePending) != nil {
+		t.Error("expected no StorageChangePending condition from the in-place path")
 	}
 }
 
 func TestReconcileStorageNoopWhenSizesMatch(t *testing.T) {
 	fx := newStorageFixture("1Gi", "1Gi", "1Gi", 1, true)
 	r, c := newStorageReconciler(t, fx.objs...)
-	// Seed a stale Blocked condition to prove a converged reconcile clears it.
 	status := &garagev1alpha1.GarageClusterStatus{}
-	setCondition(status, conditionStorageChangePending, metav1.ConditionFalse, "Blocked", "stale")
 
 	recreate, err := r.reconcileStorage(context.Background(), fx.cluster, status)
 	if err != nil {
@@ -243,9 +244,6 @@ func TestReconcileStorageNoopWhenSizesMatch(t *testing.T) {
 	}
 	if got := claimSize(t, c, ssName(), volumeNameData, 0); got.Cmp(resource.MustParse("1Gi")) != 0 {
 		t.Errorf("data claim = %s, want 1Gi (unchanged)", got.String())
-	}
-	if meta.FindStatusCondition(status.Conditions, conditionStorageChangePending) != nil {
-		t.Error("expected the stale StorageChangePending condition to be cleared")
 	}
 }
 

@@ -118,6 +118,10 @@ type fakeClusterAdmin struct {
 	recorder *meshRecorder
 	layout   *fakeLayout
 	maint    *fakeMaintenance
+
+	// health, when set, overrides the default healthy response so migration tests can drive the
+	// partition counts the re-replication wait reads.
+	health *garageadmin.GetClusterHealthResponse
 }
 
 func (f *fakeClusterAdmin) CreateMetadataSnapshot(context.Context, string) (garageadmin.MultiNodeResult, error) {
@@ -181,6 +185,28 @@ func (f *fakeClusterAdmin) ApplyLayout(_ context.Context, version int64) error {
 
 func (f *fakeClusterAdmin) RevertStagedChanges(context.Context) error { return nil }
 
+func (f *fakeClusterAdmin) AppliedLayoutNodeIDs(context.Context) ([]string, error) {
+	ids := make([]string, 0, len(f.layout.applied))
+	for id := range f.layout.applied {
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func (f *fakeClusterAdmin) RemoveNode(_ context.Context, nodeID string) error {
+	delete(f.layout.applied, nodeID)
+	f.layout.version++
+	f.layout.applyCalls++
+	return nil
+}
+
+func (f *fakeClusterAdmin) AddNode(_ context.Context, role garageadmin.DesiredRole) error {
+	f.layout.applied[role.NodeID] = struct{}{}
+	f.layout.version++
+	f.layout.applyCalls++
+	return nil
+}
+
 // newBasicClusterSpec returns a single-pool GarageCluster spec (no S3, default storage) with
 // the given replication factor and replica count, as the API server would present it after
 // defaulting. Shared by the single- and multi-node reconcile suites.
@@ -204,12 +230,16 @@ func newBasicClusterSpec(replicationFactor, replicas int32) garagev1alpha1.Garag
 }
 
 func (f *fakeClusterAdmin) Health(context.Context) (*garageadmin.GetClusterHealthResponse, error) {
+	if f.health != nil {
+		return f.health, nil
+	}
 	return &garageadmin.GetClusterHealthResponse{
 		Status:           "healthy",
 		ConnectedNodes:   1,
 		KnownNodes:       1,
 		Partitions:       256,
 		PartitionsQuorum: 256,
+		PartitionsAllOk:  256,
 	}, nil
 }
 

@@ -85,7 +85,7 @@ func (r *GarageClusterReconciler) reconcileDestructiveLayout(ctx context.Context
 
 	// Guardrail: draining a node temporarily reduces redundancy, so never start from an
 	// already-degraded cluster.
-	if status.Health == nil || status.Health.Status != "healthy" {
+	if status.Health == nil || status.Health.Status != healthStatusHealthy {
 		msg := "Refusing to remove nodes while the cluster is not healthy"
 		r.blockLayoutChange(ctx, cluster, status, layoutClient, msg)
 		return nil

@@ -134,14 +134,10 @@ func (p *LayoutPlan) StagedChanges() ([]NodeRoleChangeRequest, error) {
 // applied roles (GetClusterLayout.Roles, which excludes any staged-but-unapplied changes),
 // so the plan is stable even if a prior reconcile left changes staged.
 func (c *AdminClient) PlanLayout(ctx context.Context, desired []DesiredRole) (*LayoutPlan, error) {
-	layoutResp, err := c.GetClusterLayoutWithResponse(ctx)
+	current, err := c.appliedLayout(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if layoutResp.JSON200 == nil {
-		return nil, fmt.Errorf("GetClusterLayout: unexpected status %s", layoutResp.Status())
-	}
-	current := layoutResp.JSON200
 
 	existing := make(map[string]LayoutNodeRole, len(current.Roles))
 	for _, role := range current.Roles {
@@ -258,6 +254,85 @@ func (c *AdminClient) EnsureLayout(ctx context.Context, desired []DesiredRole) (
 		return false, plan.CurrentVersion, err
 	}
 	return true, plan.TargetVersion, nil
+}
+
+// RemoveNode drains a single node out of the cluster layout: it stages the node's removal
+// and applies it as the next layout version, after which Garage redistributes the node's
+// data to the remaining replicas. Used by the storage-migration flow (PLAN.md §4.5) to
+// drain one node before its volumes are recreated; the rest of the layout is left intact,
+// unlike PlanLayout which would also reconcile every other node's role in the same pass.
+func (c *AdminClient) RemoveNode(ctx context.Context, nodeID string) error {
+	change, err := removeRoleChange(nodeID)
+	if err != nil {
+		return err
+	}
+	return c.applySingleRoleChange(ctx, change)
+}
+
+// AddNode assigns a layout role to a single node and applies it as the next layout
+// version, after which Garage refills the node from replicas. Symmetric with RemoveNode;
+// used to rejoin a node once its volumes have been recreated.
+func (c *AdminClient) AddNode(ctx context.Context, role DesiredRole) error {
+	change, err := assignRoleChange(role)
+	if err != nil {
+		return err
+	}
+	return c.applySingleRoleChange(ctx, change)
+}
+
+// applySingleRoleChange stages exactly one role change on top of the applied layout and
+// commits it. It discards any leftover staged changes first so a crashed prior attempt
+// cannot ride along, then reads the applied version (excludes staged changes) to compute
+// the concurrency-guard target version Garage's ApplyClusterLayout requires.
+func (c *AdminClient) applySingleRoleChange(ctx context.Context, change NodeRoleChangeRequest) error {
+	if err := c.RevertStagedChanges(ctx); err != nil {
+		return err
+	}
+	version, err := c.appliedLayoutVersion(ctx)
+	if err != nil {
+		return err
+	}
+	if err := c.StageLayoutChanges(ctx, []NodeRoleChangeRequest{change}); err != nil {
+		return err
+	}
+	return c.ApplyLayout(ctx, version+1)
+}
+
+// appliedLayout fetches the currently-applied cluster layout (staged-but-unapplied changes
+// excluded), centralizing the GET and status check the layout helpers share.
+func (c *AdminClient) appliedLayout(ctx context.Context) (*GetClusterLayoutResponse, error) {
+	resp, err := c.GetClusterLayoutWithResponse(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if resp.JSON200 == nil {
+		return nil, fmt.Errorf("GetClusterLayout: unexpected status %s", resp.Status())
+	}
+	return resp.JSON200, nil
+}
+
+// AppliedLayoutNodeIDs returns the node ids assigned a role in the currently-applied layout.
+// The storage migration uses it to tell whether a node has already been drained or rejoined,
+// making its drain and re-add steps idempotent across requeues and crash-safe.
+func (c *AdminClient) AppliedLayoutNodeIDs(ctx context.Context) ([]string, error) {
+	layout, err := c.appliedLayout(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(layout.Roles))
+	for _, role := range layout.Roles {
+		ids = append(ids, role.Id)
+	}
+	return ids, nil
+}
+
+// appliedLayoutVersion returns the currently-applied cluster layout version.
+func (c *AdminClient) appliedLayoutVersion(ctx context.Context) (int64, error) {
+	layout, err := c.appliedLayout(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return layout.Version, nil
 }
 
 // roleMatches reports whether an already-assigned role equals the desired one. A zero-value

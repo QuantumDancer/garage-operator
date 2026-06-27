@@ -49,6 +49,11 @@ const (
 	conditionLayoutChangePending = "LayoutChangePending"
 )
 
+// healthStatusHealthy is Garage's GetClusterHealth status when every storage node is
+// connected. The destructive-layout and storage-migration guardrails only drain a node from
+// this state.
+const healthStatusHealthy = "healthy"
+
 // annotationApproveLayout gates a destructive layout change (node drain/removal). Set its
 // value to the pending target layout version reported in the LayoutChangePending condition
 // to authorize the operator to apply the drain. Keying approval to the version means a stale
@@ -75,6 +80,9 @@ type clusterAdmin interface {
 	PreviewStagedChanges(ctx context.Context) ([]string, error)
 	ApplyLayout(ctx context.Context, version int64) error
 	RevertStagedChanges(ctx context.Context) error
+	AppliedLayoutNodeIDs(ctx context.Context) ([]string, error)
+	RemoveNode(ctx context.Context, nodeID string) error
+	AddNode(ctx context.Context, role garageadmin.DesiredRole) error
 	Health(ctx context.Context) (*garageadmin.GetClusterHealthResponse, error)
 	CreateMetadataSnapshot(ctx context.Context, node string) (garageadmin.MultiNodeResult, error)
 	LaunchRepair(ctx context.Context, node, repairType string) (garageadmin.MultiNodeResult, error)
@@ -104,7 +112,7 @@ func defaultAdminClientFactory(baseURL, token string) (clusterAdmin, error) {
 // +kubebuilder:rbac:groups=garage.rottler.io,resources=garageclusters/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services;configmaps;secrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
@@ -157,7 +165,15 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if !ready {
 		log.Info("Waiting for Garage pods to become ready")
 		setCondition(status, conditionWorkloadReady, metav1.ConditionFalse, "PodsNotReady", "Waiting for Garage pods to become ready")
-		setCondition(status, conditionReady, metav1.ConditionFalse, "WorkloadNotReady", "Workload is not ready")
+		// A storage migration deliberately takes a node's pod down to recreate its volume, so a
+		// not-ready workload mid-migration is expected, not a fault. Keep reporting Ready/
+		// StorageMigrating in that case so the condition does not flap to a fault for every node
+		// the migration recreates; the cluster keeps serving on its remaining nodes throughout.
+		if status.StorageMigration != nil {
+			setCondition(status, conditionReady, metav1.ConditionTrue, "StorageMigrating", migrationReadyMessage(status))
+		} else {
+			setCondition(status, conditionReady, metav1.ConditionFalse, "WorkloadNotReady", "Workload is not ready")
+		}
 		return r.finish(ctx, &cluster, status, ctrl.Result{RequeueAfter: workloadRequeue})
 	}
 	setCondition(status, conditionWorkloadReady, metav1.ConditionTrue, "PodsReady", "All Garage pods are ready")
@@ -188,10 +204,24 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		setCondition(status, conditionPeersConnected, metav1.ConditionTrue, "SingleNode", "Single-node cluster needs no peering")
 	}
 
-	// Refresh health before the layout step: the destructive-layout guardrail refuses to
-	// drain a node while the cluster is unhealthy.
+	// Refresh health before the layout and migration steps: both guardrails refuse to drain a
+	// node while the cluster is unhealthy, and the migration waits on the partition counts.
 	if health, herr := layoutClient.Health(ctx); herr == nil {
 		status.Health = buildHealthStatus(health)
+	}
+
+	// A storage migration recreates a node's volumes one node at a time and owns the layout for
+	// the node it is moving, so while one is active the generic layout reconciliation is skipped
+	// (it would otherwise apply the node's new capacity before the volume exists). The cluster
+	// stays serving throughout, so it is reported Ready with the migration progress.
+	migrating, err := r.reconcileStorageMigration(ctx, &cluster, status, layoutClient, desired)
+	if err != nil {
+		setCondition(status, conditionReady, metav1.ConditionFalse, "StorageMigrationError", err.Error())
+		return ctrl.Result{}, err
+	}
+	if migrating {
+		setCondition(status, conditionReady, metav1.ConditionTrue, "StorageMigrating", migrationReadyMessage(status))
+		return r.finish(ctx, &cluster, status, ctrl.Result{RequeueAfter: workloadRequeue})
 	}
 
 	if err := r.reconcileLayout(ctx, &cluster, status, layoutClient, desired); err != nil {
@@ -490,6 +520,7 @@ func buildHealthStatus(h *garageadmin.GetClusterHealthResponse) *garagev1alpha1.
 		ConnectedNodes:   h.ConnectedNodes,
 		KnownNodes:       h.KnownNodes,
 		PartitionsQuorum: fmt.Sprintf("%d/%d", h.PartitionsQuorum, h.Partitions),
+		PartitionsAllOk:  fmt.Sprintf("%d/%d", h.PartitionsAllOk, h.Partitions),
 	}
 }
 

@@ -1407,6 +1407,13 @@ spec:
                   knownNodes:
                     description: knownNodes is the number of nodes known to the cluster.
                     type: integer
+                  partitionsAllOk:
+                    description: |-
+                      partitionsAllOk is the "<fullyReplicated>/<total>" ratio of partitions connected to
+                      all of their responsible storage nodes. When the two numbers match, the cluster is
+                      fully re-replicated — the signal the storage migration waits for before it destroys
+                      and recreates a node's volumes.
+                    type: string
                   partitionsQuorum:
                     description: partitionsQuorum is the "<withQuorum>/<total>" partition
                       quorum ratio.
@@ -1417,6 +1424,7 @@ spec:
                 required:
                 - connectedNodes
                 - knownNodes
+                - partitionsAllOk
                 - partitionsQuorum
                 - status
                 type: object
@@ -1535,6 +1543,36 @@ spec:
               rpcTokenSecret:
                 description: rpcTokenSecret names the Secret holding the RPC secret.
                 type: string
+              storageMigration:
+                description: |-
+                  storageMigration reports an in-progress storage migration. Present only while a
+                  volume change that cannot be served in place is being rolled through the pool.
+                properties:
+                  message:
+                    description: message is a human-readable summary of the current
+                      step.
+                    type: string
+                  ordinal:
+                    description: ordinal is the StatefulSet ordinal of the node currently
+                      being migrated.
+                    format: int32
+                    type: integer
+                  phase:
+                    description: phase is the stage the current node is in.
+                    enum:
+                    - Draining
+                    - AwaitingReplication
+                    - RecreatingVolume
+                    - AwaitingRejoin
+                    type: string
+                  pool:
+                    description: pool is the node pool being migrated.
+                    type: string
+                required:
+                - ordinal
+                - phase
+                - pool
+                type: object
             type: object
         required:
         - spec
