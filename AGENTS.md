@@ -98,7 +98,12 @@ finalizers, status logic, tests, build/CI — remains fully agent-owned.
 ```
 make manifests  # Regenerate CRDs/RBAC from markers
 make generate   # Regenerate DeepCopy methods
+make helm-chart # Regenerate the Helm chart (dist/chart) from config/ — CRDs/RBAC drift otherwise
 ```
+
+`make helm-chart` is NOT run by `make manifests`; the Helm chart is a separate generated
+artifact (via the pinned kubebuilder CLI). CI (`generate.yml`) drift-checks it, so skipping
+it after an API/RBAC change fails the build.
 
 **After editing `*.go` files:**
 

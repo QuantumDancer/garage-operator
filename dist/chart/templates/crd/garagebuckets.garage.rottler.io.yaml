@@ -1,0 +1,406 @@
+{{- if .Values.crd.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    {{- if .Values.crd.keep }}
+    "helm.sh/resource-policy": keep
+    {{- end }}
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: garagebuckets.garage.rottler.io
+spec:
+  group: garage.rottler.io
+  names:
+    kind: GarageBucket
+    listKind: GarageBucketList
+    plural: garagebuckets
+    singular: garagebucket
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - jsonPath: .status.bucketId
+      name: BucketId
+      type: string
+    - jsonPath: .spec.clusterRef.name
+      name: Cluster
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: GarageBucket is the Schema for the garagebuckets API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of GarageBucket
+            properties:
+              clusterRef:
+                description: clusterRef selects the GarageCluster the bucket lives
+                  in.
+                properties:
+                  name:
+                    description: name is the referenced GarageCluster's name.
+                    type: string
+                  namespace:
+                    description: |-
+                      namespace is the referenced GarageCluster's namespace; defaults to the referencing
+                      object's own namespace when omitted.
+                    type: string
+                required:
+                - name
+                type: object
+              cors:
+                description: cors are the bucket's cross-origin resource sharing rules.
+                items:
+                  description: |-
+                    CORSRule is a single cross-origin resource sharing rule. It mirrors the S3 CORS rule
+                    Garage accepts, rendered in Kubernetes camelCase.
+                  properties:
+                    allowedHeaders:
+                      description: allowedHeaders are request headers permitted in
+                        a preflight request.
+                      items:
+                        type: string
+                      type: array
+                    allowedMethods:
+                      description: allowedMethods are the HTTP methods (e.g. GET,
+                        PUT) permitted for the origins.
+                      items:
+                        type: string
+                      minItems: 1
+                      type: array
+                    allowedOrigins:
+                      description: allowedOrigins are the origins (e.g. "*", "https://example.com")
+                        the rule applies to.
+                      items:
+                        type: string
+                      minItems: 1
+                      type: array
+                    exposeHeaders:
+                      description: exposeHeaders are response headers exposed to the
+                        browser.
+                      items:
+                        type: string
+                      type: array
+                    id:
+                      description: id optionally identifies the rule.
+                      type: string
+                    maxAgeSeconds:
+                      description: maxAgeSeconds is how long a browser may cache a
+                        preflight response.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                  required:
+                  - allowedMethods
+                  - allowedOrigins
+                  type: object
+                type: array
+              deletionPolicy:
+                default: Delete
+                description: |-
+                  deletionPolicy controls whether the Garage bucket is deleted with the CR. The default
+                  is Delete (fully-managed: deleting the CR deletes the bucket); a non-empty bucket is
+                  refused until emptied. Set Retain to leave the bucket in place when the CR is deleted.
+                enum:
+                - Retain
+                - Delete
+                type: string
+              globalAliases:
+                description: |-
+                  globalAliases are cluster-wide unique aliases for the bucket. Empty means the bucket
+                  has no global alias and is addressable only by its id. Aliases must be unique within
+                  this bucket; cluster-wide uniqueness is enforced by Garage and surfaced via status.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: set
+              grants:
+                description: grants grant GarageKeys permissions on the bucket. Reconciled
+                  in Phase 3 (see BucketGrant).
+                items:
+                  description: |-
+                    BucketGrant grants a GarageKey permissions on this bucket.
+
+                    NOTE: grants are reconciled in Phase 3, once the GarageKey controller exists to resolve
+                    keyRef to a Garage access key id. The field is accepted now but not yet acted on.
+                  properties:
+                    keyRef:
+                      description: keyRef is the GarageKey the permissions are granted
+                        to.
+                      properties:
+                        name:
+                          description: name is the referenced GarageKey's name.
+                          type: string
+                        namespace:
+                          description: |-
+                            namespace is the referenced GarageKey's namespace; defaults to the referencing
+                            object's own namespace when omitted.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    owner:
+                      description: owner allows the key to manage the bucket itself
+                        (aliases, website, quotas).
+                      type: boolean
+                    read:
+                      description: read allows the key to read objects from the bucket.
+                      type: boolean
+                    write:
+                      description: write allows the key to write objects to the bucket.
+                      type: boolean
+                  required:
+                  - keyRef
+                  type: object
+                type: array
+              lifecycle:
+                description: lifecycle are the bucket's object-lifecycle rules.
+                items:
+                  description: LifecycleRule is one object-lifecycle rule on the bucket.
+                  properties:
+                    abortIncompleteMultipartUpload:
+                      description: abortIncompleteMultipartUpload cleans up unfinished
+                        multipart uploads.
+                      properties:
+                        daysAfterInitiation:
+                          description: daysAfterInitiation aborts uploads this many
+                            days after they were started.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                      required:
+                      - daysAfterInitiation
+                      type: object
+                    expiration:
+                      description: expiration expires matching objects.
+                      properties:
+                        date:
+                          description: date expires objects on this RFC 3339 calendar
+                            date (e.g. "2026-01-01").
+                          type: string
+                        days:
+                          description: days expires objects this many days after creation.
+                          format: int32
+                          minimum: 1
+                          type: integer
+                      type: object
+                      x-kubernetes-validations:
+                      - message: expiration must set exactly one of days or date
+                        rule: has(self.days) != (has(self.date) && size(self.date)
+                          > 0)
+                    filter:
+                      description: filter narrows which objects the rule applies to;
+                        omitted means the whole bucket.
+                      properties:
+                        objectSizeGreaterThan:
+                          description: objectSizeGreaterThan matches objects strictly
+                            larger than this many bytes.
+                          format: int64
+                          minimum: 0
+                          type: integer
+                        objectSizeLessThan:
+                          description: objectSizeLessThan matches objects strictly
+                            smaller than this many bytes.
+                          format: int64
+                          minimum: 0
+                          type: integer
+                        prefix:
+                          description: prefix matches object keys beginning with this
+                            string.
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                      - message: objectSizeGreaterThan must be less than objectSizeLessThan
+                        rule: '!has(self.objectSizeGreaterThan) || !has(self.objectSizeLessThan)
+                          || self.objectSizeGreaterThan < self.objectSizeLessThan'
+                    id:
+                      description: id optionally identifies the rule.
+                      type: string
+                    status:
+                      description: status enables or disables the rule.
+                      enum:
+                      - Enabled
+                      - Disabled
+                      type: string
+                  required:
+                  - status
+                  type: object
+                  x-kubernetes-validations:
+                  - message: a lifecycle rule must set expiration or abortIncompleteMultipartUpload
+                    rule: has(self.expiration) || has(self.abortIncompleteMultipartUpload)
+                type: array
+              localAliases:
+                description: localAliases are per-key aliases. Reconciled in Phase
+                  3 (see LocalAlias).
+                items:
+                  description: |-
+                    LocalAlias binds a per-key alias name to a GarageKey for this bucket.
+
+                    NOTE: local aliases are reconciled in Phase 3, once the GarageKey controller exists to
+                    resolve keyRef to a Garage access key id. The field is accepted now but not yet acted on.
+                  properties:
+                    alias:
+                      description: alias is the bucket name visible to that key.
+                      type: string
+                    keyRef:
+                      description: keyRef is the GarageKey the alias is scoped to.
+                      properties:
+                        name:
+                          description: name is the referenced GarageKey's name.
+                          type: string
+                        namespace:
+                          description: |-
+                            namespace is the referenced GarageKey's namespace; defaults to the referencing
+                            object's own namespace when omitted.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                  required:
+                  - alias
+                  - keyRef
+                  type: object
+                type: array
+              quotas:
+                description: quotas caps the bucket's size and/or object count.
+                properties:
+                  maxObjects:
+                    description: maxObjects is the maximum number of objects in the
+                      bucket.
+                    format: int64
+                    minimum: 0
+                    type: integer
+                  maxSize:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: maxSize is the maximum total size of all objects
+                      in the bucket (e.g. 50Gi).
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                type: object
+              website:
+                description: website configures static website hosting.
+                properties:
+                  enabled:
+                    description: enabled turns website serving on for the bucket.
+                    type: boolean
+                  errorDocument:
+                    description: errorDocument is the object key served for 4xx responses
+                      (e.g. error.html).
+                    type: string
+                  indexDocument:
+                    description: indexDocument is the object key served at the root
+                      of the site (e.g. index.html).
+                    type: string
+                required:
+                - enabled
+                type: object
+            required:
+            - clusterRef
+            type: object
+          status:
+            description: status defines the observed state of GarageBucket
+            properties:
+              bucketId:
+                description: bucketId is the Garage bucket identifier the CR is bound
+                  to.
+                type: string
+              conditions:
+                description: |-
+                  conditions represent the current state of the GarageBucket resource.
+                  Known types: Ready.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: observedGeneration is the generation most recently reconciled
+                  into status.
+                format: int64
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+{{- end }}
