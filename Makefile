@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= ghcr.io/quantumdancer/garage-operator:latest
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -150,7 +150,7 @@ docker-push: ## Push docker image with the manager.
 # - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 # - be able to push the image to your registry (i.e. if you do not set a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
 # To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
-PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
+PLATFORMS ?= linux/amd64,linux/arm64
 .PHONY: docker-buildx
 docker-buildx: ## Build and push docker image for the manager for cross-platform support
 	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
@@ -166,6 +166,20 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	mkdir -p dist
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default > dist/install.yaml
+
+# The Helm chart (dist/chart) is generated from config/ via the kubebuilder helm plugin,
+# which reads dist/install.yaml. It is NOT refreshed by `make manifests` — run this after
+# any API/RBAC/webhook change so the chart's CRDs/RBAC don't silently drift. The chart is
+# pure plugin output (the ghcr image default flows in from config/manager), so --force is
+# safe; CI re-runs this and fails on a diff. Needs the kubebuilder CLI on PATH.
+.PHONY: helm-chart
+helm-chart: build-installer kubebuilder ## Regenerate the Helm chart (dist/chart) from config/.
+	$(KUBEBUILDER) edit --plugins=helm/v2-alpha --force
+	# The plugin also rewrites .github/workflows/test-chart.yml with a bare `on: push:` and a
+	# generic `name: Run on Ubuntu` job. That CI workflow is hand-maintained (scoped triggers +
+	# a unique gating context — see the note in the file), so restore it; only dist/chart is the
+	# generated artifact we drift-check.
+	git checkout -- .github/workflows/test-chart.yml
 
 ##@ Deployment
 
@@ -202,6 +216,7 @@ $(LOCALBIN):
 ## Tool Binaries
 KUBECTL ?= kubectl
 KIND ?= kind
+KUBEBUILDER ?= $(LOCALBIN)/kubebuilder
 KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
@@ -210,6 +225,9 @@ GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
 CONTROLLER_TOOLS_VERSION ?= v0.21.0
+# Pin the kubebuilder CLI: it regenerates the Helm chart, which is drift-checked in CI, so
+# the local and CI versions must match. Keep in sync with PROJECT's cliVersion.
+KUBEBUILDER_VERSION ?= v4.15.0
 
 #ENVTEST_VERSION is the controller-runtime version to use for setup-envtest, derived from go.mod
 ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
@@ -226,6 +244,17 @@ GOLANGCI_LINT_VERSION ?= v2.12.2
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
 	$(call go-install-tool,$(KUSTOMIZE),sigs.k8s.io/kustomize/kustomize/v5,$(KUSTOMIZE_VERSION))
+
+.PHONY: kubebuilder
+kubebuilder: $(KUBEBUILDER) ## Download the pinned kubebuilder CLI locally if necessary.
+# kubebuilder is published as a release binary (not `go install`able), so fetch it directly.
+# Re-download unless the existing binary already reports the pinned version.
+$(KUBEBUILDER): $(LOCALBIN)
+	@if ! "$(KUBEBUILDER)" version 2>/dev/null | grep -q '$(KUBEBUILDER_VERSION:v%=%)'; then \
+		echo "Downloading kubebuilder $(KUBEBUILDER_VERSION)"; \
+		curl -fsSL -o "$(KUBEBUILDER)" "https://github.com/kubernetes-sigs/kubebuilder/releases/download/$(KUBEBUILDER_VERSION)/kubebuilder_$$(go env GOOS)_$$(go env GOARCH)"; \
+		chmod +x "$(KUBEBUILDER)"; \
+	fi
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
@@ -274,3 +303,54 @@ endef
 define gomodver
 $(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
 endef
+
+##@ Helm Deployment
+
+## Helm binary to use for deploying the chart
+HELM ?= helm
+## Namespace to deploy the Helm release
+HELM_NAMESPACE ?= garage-operator-system
+## Name of the Helm release
+HELM_RELEASE ?= garage-operator
+## Path to the Helm chart directory
+HELM_CHART_DIR ?= dist/chart
+## Additional arguments to pass to helm commands
+HELM_EXTRA_ARGS ?=
+
+.PHONY: install-helm
+install-helm: ## Install the latest version of Helm.
+	@command -v $(HELM) >/dev/null 2>&1 || { \
+		echo "Installing Helm..." && \
+		curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash; \
+	}
+
+.PHONY: helm-deploy
+helm-deploy: install-helm ## Deploy manager to the K8s cluster via Helm. Specify an image with IMG.
+	# Bind the make var into a shell var first: a Makefile-internal `IMG ?=` is not
+	# exported to recipe sub-shells (only command-line/env vars are), so reading $$IMG
+	# directly would be empty for a bare `make helm-deploy` and render a broken image ref.
+	@img='$(IMG)'; \
+	$(HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART_DIR) \
+		--namespace $(HELM_NAMESPACE) \
+		--create-namespace \
+		--set manager.image.repository=$${img%:*} \
+		--set manager.image.tag=$${img##*:} \
+		--wait \
+		--timeout 5m \
+		$(HELM_EXTRA_ARGS)
+
+.PHONY: helm-uninstall
+helm-uninstall: ## Uninstall the Helm release from the K8s cluster.
+	$(HELM) uninstall $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-status
+helm-status: ## Show Helm release status.
+	$(HELM) status $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-history
+helm-history: ## Show Helm release history.
+	$(HELM) history $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-rollback
+helm-rollback: ## Rollback to previous Helm release.
+	$(HELM) rollback $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)

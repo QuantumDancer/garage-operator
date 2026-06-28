@@ -1,0 +1,235 @@
+{{- if .Values.crd.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    {{- if .Values.crd.keep }}
+    "helm.sh/resource-policy": keep
+    {{- end }}
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: garagekeys.garage.rottler.io
+spec:
+  group: garage.rottler.io
+  names:
+    kind: GarageKey
+    listKind: GarageKeyList
+    plural: garagekeys
+    singular: garagekey
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    - jsonPath: .status.keyId
+      name: KeyId
+      type: string
+    - jsonPath: .status.credentialsSecret
+      name: Secret
+      type: string
+    - jsonPath: .spec.clusterRef.name
+      name: Cluster
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: GarageKey is the Schema for the garagekeys API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of GarageKey
+            properties:
+              clusterRef:
+                description: clusterRef selects the GarageCluster the key belongs
+                  to.
+                properties:
+                  name:
+                    description: name is the referenced GarageCluster's name.
+                    type: string
+                  namespace:
+                    description: |-
+                      namespace is the referenced GarageCluster's namespace; defaults to the referencing
+                      object's own namespace when omitted.
+                    type: string
+                required:
+                - name
+                type: object
+              deletionPolicy:
+                default: Delete
+                description: |-
+                  deletionPolicy controls whether the Garage key is deleted with the CR. The default is
+                  Delete; set Retain to leave the key and its Secret in place when the CR is deleted.
+                enum:
+                - Retain
+                - Delete
+                type: string
+              expiration:
+                description: expiration is when the key stops working (RFC 3339).
+                  Omitted means the key never expires.
+                format: date-time
+                type: string
+              import:
+                description: import adopts an existing key instead of generating one.
+                properties:
+                  accessKeyIdKey:
+                    description: accessKeyIdKey is the Secret data key holding the
+                      access key id; defaults to accessKeyId.
+                    type: string
+                  secretAccessKeyKey:
+                    description: secretAccessKeyKey is the Secret data key holding
+                      the secret key; defaults to secretAccessKey.
+                    type: string
+                  secretName:
+                    description: secretName is the Secret holding the credentials
+                      to import.
+                    type: string
+                required:
+                - secretName
+                type: object
+              name:
+                description: |-
+                  name is the display name in Garage; defaults to metadata.name. Garage key names are
+                  freeform, non-unique labels (keys are identified by id), so this is only a human label.
+                type: string
+              output:
+                description: output controls where the resulting credentials Secret
+                  is written.
+                properties:
+                  secretName:
+                    description: |-
+                      secretName is the Secret the operator writes the credentials into; defaults to
+                      <cr-name>-credentials. The Secret carries data keys accessKeyId and secretAccessKey.
+                    type: string
+                type: object
+              permissions:
+                description: permissions are the key's global capabilities.
+                properties:
+                  createBucket:
+                    description: createBucket lets the key create new buckets on its
+                      own (Garage KeyPerm.createBucket).
+                    type: boolean
+                type: object
+              renewBefore:
+                description: |-
+                  renewBefore asks the operator to rotate the key this long before expiration. Reconciled
+                  once the §10 rotation flow lands; ignored without expiration and currently only stored.
+                type: string
+            required:
+            - clusterRef
+            type: object
+            x-kubernetes-validations:
+            - message: renewBefore requires expiration to be set
+              rule: '!has(self.renewBefore) || has(self.expiration)'
+          status:
+            description: status defines the observed state of GarageKey
+            properties:
+              conditions:
+                description: |-
+                  conditions represent the current state of the GarageKey resource.
+                  Known types: Ready, CredentialsPublished.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              credentialsSecret:
+                description: credentialsSecret is the Secret the access credentials
+                  were written to.
+                type: string
+              expiration:
+                description: expiration mirrors GetKeyInfo; absent when the key never
+                  expires.
+                format: date-time
+                type: string
+              expired:
+                description: expired mirrors GetKeyInfo.expired.
+                type: boolean
+              keyId:
+                description: keyId is the Garage access key id the CR is bound to.
+                type: string
+              observedGeneration:
+                description: observedGeneration is the generation most recently reconciled
+                  into status.
+                format: int64
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+{{- end }}

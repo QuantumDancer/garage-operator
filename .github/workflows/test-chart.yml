@@ -1,0 +1,85 @@
+name: Test Chart
+
+# NOTE: hand-maintained, not pure plugin output. The kubebuilder helm plugin regenerates
+# this file with a bare `on: push:` and a generic `name: Run on Ubuntu` job; both are repo
+# footguns (the double-run on PR branches, and a status-check context that collides with the
+# old "Run on Ubuntu" jobs and breaks required-check gating). So `make helm-chart` restores
+# this file after regenerating the chart, and this workflow is excluded from the chart drift
+# check. Keep the trigger scoping and the unique job name below.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  test-chart:
+    permissions:
+      contents: read
+    name: Helm Chart
+    runs-on: ubuntu-latest
+    env:
+      IMG: controller:latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install the latest version of kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Verify kind installation
+        run: kind version
+
+      - name: Create kind cluster
+        run: kind create cluster
+
+      - name: Prepare garage-operator
+        run: |
+          go mod tidy
+          make docker-build
+          kind load docker-image $IMG
+
+      - name: Install Helm
+        run: make install-helm
+
+      - name: Lint Helm Chart
+        run: |
+          helm lint ./dist/chart
+
+
+      - name: Install cert-manager via Helm (wait for readiness)
+        run: |
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update
+          helm install cert-manager jetstack/cert-manager \
+            --namespace cert-manager \
+            --create-namespace \
+            --set crds.enabled=true \
+            --wait \
+            --timeout 300s
+
+# TODO: Uncomment if Prometheus is enabled
+#      - name: Install Prometheus Operator CRDs
+#        run: |
+#          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#          helm repo update
+#          helm install prometheus-crds prometheus-community/prometheus-operator-crds
+
+      - name: Deploy manager via Helm
+        run: |
+          make helm-deploy
+
+      - name: Check Helm release status
+        run: |
+          make helm-status
