@@ -31,9 +31,36 @@ const (
 	certmanagerVersion = "v1.20.2"
 	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
 
+	// prometheusOperatorVersion pins the Prometheus Operator release whose PodMonitor CRD the
+	// metrics e2e installs so the operator can create a PodMonitor against a real CRD.
+	prometheusOperatorVersion = "v0.92.0"
+	podMonitorCRDURLTmpl      = "https://raw.githubusercontent.com/prometheus-operator/" +
+		"prometheus-operator/%s/example/prometheus-operator-crd/monitoring.coreos.com_podmonitors.yaml"
+
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
 )
+
+// InstallPodMonitorCRD installs just the PodMonitor CRD from the Prometheus Operator project.
+// Server-side apply is required: the CRD's embedded OpenAPI schema exceeds the size limit of
+// the client-side last-applied annotation.
+func InstallPodMonitorCRD() error {
+	url := fmt.Sprintf(podMonitorCRDURLTmpl, prometheusOperatorVersion)
+	if _, err := Run(exec.Command("kubectl", "apply", "--server-side", "-f", url)); err != nil {
+		return err
+	}
+	_, err := Run(exec.Command("kubectl", "wait", "--for", "condition=Established",
+		"crd/podmonitors.monitoring.coreos.com", "--timeout", "60s"))
+	return err
+}
+
+// UninstallPodMonitorCRD removes the PodMonitor CRD installed by InstallPodMonitorCRD.
+func UninstallPodMonitorCRD() {
+	url := fmt.Sprintf(podMonitorCRDURLTmpl, prometheusOperatorVersion)
+	if _, err := Run(exec.Command("kubectl", "delete", "--ignore-not-found", "-f", url)); err != nil {
+		warnError(err)
+	}
+}
 
 func warnError(err error) {
 	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)

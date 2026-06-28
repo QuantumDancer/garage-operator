@@ -1312,6 +1312,129 @@ spec:
 			_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", ns))
 		})
 
+		It("should create a PodMonitor scraping Garage metrics when metrics are enabled", Label("metrics"), func() {
+			const ns = "garage-metrics-e2e"
+			const clusterName = "metrics"
+			const podMonitorName = clusterName + "-metrics"
+			const curlPod = "curl-garage-metrics"
+
+			By("preloading the Garage image into the Kind cluster")
+			_, err := utils.Run(exec.Command("docker", "pull", garageImage))
+			Expect(err).NotTo(HaveOccurred(), "Failed to pull the Garage image")
+			Expect(utils.LoadImageToKindClusterWithName(garageImage)).To(Succeed(), "Failed to load Garage image into Kind")
+
+			By("installing the Prometheus Operator PodMonitor CRD")
+			// The CRD is cluster-scoped, so remove it on the way out (even on failure) to keep
+			// the shared Kind cluster clean for the next spec/run.
+			DeferCleanup(utils.UninstallPodMonitorCRD)
+			Expect(utils.InstallPodMonitorCRD()).To(Succeed(), "Failed to install PodMonitor CRD")
+
+			By("creating the metrics-test namespace")
+			_, _ = utils.Run(exec.Command("kubectl", "create", "ns", ns))
+			DeferCleanup(func() {
+				_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", ns, "--ignore-not-found", "--timeout=120s"))
+			})
+
+			By("applying a single-node GarageCluster with metrics enabled")
+			clusterManifest := fmt.Sprintf(`apiVersion: garage.rottler.io/v1alpha1
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replicationFactor: 1
+  nodePools:
+    - name: default
+      replicas: 1
+      storage:
+        data: { size: 1Gi }
+        meta: { size: 1Gi }
+  metrics:
+    enabled: true
+    interval: 20s
+    labels:
+      release: kube-prometheus-stack
+`, clusterName, ns)
+			clusterFile := filepath.Join("/tmp", "garagecluster-metrics-e2e.yaml")
+			Expect(os.WriteFile(clusterFile, []byte(clusterManifest), os.FileMode(0o644))).To(Succeed())
+			_, err = utils.Run(exec.Command("kubectl", "apply", "-f", clusterFile))
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply GarageCluster")
+
+			By("waiting for the cluster to become Ready and report MetricsReady")
+			Eventually(func(g Gomega) {
+				ready, err := utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", ns, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ready).To(Equal("True"), "cluster is not Ready")
+
+				metricsReady, err := utils.Run(exec.Command("kubectl", "get", "garagecluster", clusterName,
+					"-n", ns, "-o", "jsonpath={.status.conditions[?(@.type=='MetricsReady')].status}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(metricsReady).To(Equal("True"), "MetricsReady is not True")
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("verifying the operator created a well-formed PodMonitor")
+			Eventually(func(g Gomega) {
+				port, err := utils.Run(exec.Command("kubectl", "get", "podmonitor", podMonitorName, "-n", ns,
+					"-o", "jsonpath={.spec.podMetricsEndpoints[0].port}"))
+				g.Expect(err).NotTo(HaveOccurred(), "PodMonitor not found")
+				g.Expect(port).To(Equal("admin"), "PodMonitor should scrape the admin port")
+
+				path, _ := utils.Run(exec.Command("kubectl", "get", "podmonitor", podMonitorName, "-n", ns,
+					"-o", "jsonpath={.spec.podMetricsEndpoints[0].path}"))
+				g.Expect(path).To(Equal("/metrics"))
+
+				interval, _ := utils.Run(exec.Command("kubectl", "get", "podmonitor", podMonitorName, "-n", ns,
+					"-o", "jsonpath={.spec.podMetricsEndpoints[0].interval}"))
+				g.Expect(interval).To(Equal("20s"))
+
+				label, _ := utils.Run(exec.Command("kubectl", "get", "podmonitor", podMonitorName, "-n", ns,
+					"-o", "jsonpath={.metadata.labels.release}"))
+				g.Expect(label).To(Equal("kube-prometheus-stack"), "user labels should be stamped on the PodMonitor")
+
+				owner, _ := utils.Run(exec.Command("kubectl", "get", "podmonitor", podMonitorName, "-n", ns,
+					"-o", "jsonpath={.metadata.ownerReferences[0].name}"))
+				g.Expect(owner).To(Equal(clusterName), "PodMonitor should be owned by the cluster")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("confirming real Garage actually serves Prometheus metrics on the admin port")
+			// Verify the data path the PodMonitor points at: scrape the pod's admin port by its
+			// pod IP (curlimages/curl is Alpine/musl and cannot resolve *.svc DNS in this Kind
+			// env). Garage sets no metrics_token, so /metrics is unauthenticated.
+			podIP, err := utils.Run(exec.Command("kubectl", "get", "pod", clusterName+"-default-0", "-n", ns,
+				"-o", "jsonpath={.status.podIP}"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(podIP).NotTo(BeEmpty(), "Garage pod has no IP")
+
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", curlPod, "-n", ns, "--ignore-not-found"))
+			_, err = utils.Run(exec.Command("kubectl", "run", curlPod, "--restart=Never", "-n", ns,
+				"--image=curlimages/curl:latest", "--",
+				"/bin/sh", "-c",
+				fmt.Sprintf("for i in $(seq 1 30); do curl -fsS http://%s:3903/metrics && exit 0 || sleep 3; done; exit 1", podIP)))
+			Expect(err).NotTo(HaveOccurred(), "Failed to start curl pod")
+			Eventually(func(g Gomega) {
+				phase, _ := utils.Run(exec.Command("kubectl", "get", "pod", curlPod, "-n", ns,
+					"-o", "jsonpath={.status.phase}"))
+				g.Expect(phase).To(Equal("Succeeded"), "curl against Garage /metrics did not succeed")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+			logs, err := utils.Run(exec.Command("kubectl", "logs", curlPod, "-n", ns))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(logs).To(ContainSubstring("# HELP"), "Garage /metrics should return Prometheus exposition format")
+
+			By("disabling metrics and confirming the PodMonitor is removed")
+			_, err = utils.Run(exec.Command("kubectl", "patch", "garagecluster", clusterName, "-n", ns,
+				"--type=merge", "-p", `{"spec":{"metrics":{"enabled":false}}}`))
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				_, err := utils.Run(exec.Command("kubectl", "get", "podmonitor", podMonitorName, "-n", ns))
+				g.Expect(err).To(HaveOccurred(), "PodMonitor should be deleted once metrics are disabled")
+				g.Expect(err.Error()).To(ContainSubstring("NotFound"))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("cleaning up the cluster")
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "-f", clusterFile, "--ignore-not-found"))
+		})
+
 		// The deployed CRDs carry CEL (x-kubernetes-validations) rules instead of an admission
 		// webhook. A server-side dry-run exercises those rules in the real API server without
 		// persisting anything or needing a running Garage cluster, proving the packaged CRDs
