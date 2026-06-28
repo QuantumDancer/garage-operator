@@ -163,6 +163,30 @@ type ServicesConfig struct {
 	Web ServiceConfig `json:"web,omitempty"`
 }
 
+// MetricsConfig configures Prometheus scraping of the cluster's per-node Garage metrics.
+// Garage exposes Prometheus-format metrics on each node's admin endpoint. Because those
+// metrics are per-node — like the admin operations that keep the admin port headless-only —
+// the operator scrapes every pod directly: when enabled it creates a PodMonitor (Prometheus
+// Operator, monitoring.coreos.com/v1) targeting the pods' admin port. The PodMonitor is an
+// implementation detail; if the Prometheus Operator CRDs are not installed the operator
+// reports this and otherwise does nothing.
+type MetricsConfig struct {
+	// enabled turns on Prometheus scraping of the cluster's Garage nodes.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// interval is the Prometheus scrape interval (a Prometheus duration such as "30s" or
+	// "1m"). The Prometheus default is used if omitted.
+	// +kubebuilder:validation:Pattern="^(0|(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?)$"
+	// +optional
+	Interval string `json:"interval,omitempty"`
+
+	// labels are extra labels stamped on the generated scrape config so a Prometheus
+	// instance's selector can pick it up.
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
 // S3ApiConfig configures the Garage S3 API endpoint.
 type S3ApiConfig struct {
 	// region is the S3 region name advertised by Garage.
@@ -308,6 +332,10 @@ type GarageClusterSpec struct {
 	// services configures exposure of the S3 and web endpoints.
 	// +optional
 	Services ServicesConfig `json:"services,omitempty"`
+
+	// metrics configures Prometheus scraping of the cluster's per-node Garage metrics.
+	// +optional
+	Metrics MetricsConfig `json:"metrics,omitempty"`
 
 	// s3 configures the S3 API and website settings.
 	// +optional

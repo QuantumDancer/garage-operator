@@ -139,6 +139,28 @@ spec:
                   metadata DB at that interval. Empty disables snapshots.
                   https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/#metadata_auto_snapshot_interval
                 type: string
+              metrics:
+                description: metrics configures Prometheus scraping of the cluster's
+                  per-node Garage metrics.
+                properties:
+                  enabled:
+                    description: enabled turns on Prometheus scraping of the cluster's
+                      Garage nodes.
+                    type: boolean
+                  interval:
+                    description: |-
+                      interval is the Prometheus scrape interval (a Prometheus duration such as "30s" or
+                      "1m"). The Prometheus default is used if omitted.
+                    pattern: ^(0|(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?)$
+                    type: string
+                  labels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      labels are extra labels stamped on the generated scrape config so a Prometheus
+                      instance's selector can pick it up.
+                    type: object
+                type: object
               nodePools:
                 description: |-
                   nodePools defines one or more pools of Garage nodes. Each pool becomes a StatefulSet.

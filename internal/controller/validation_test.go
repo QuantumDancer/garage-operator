@@ -156,6 +156,24 @@ var _ = Describe("CRD validation rules", Ordered, func() {
 			}
 			Expect(k8sClient.Create(ctx, c)).To(Succeed())
 		})
+
+		It("accepts metrics with a valid Prometheus duration interval", func() {
+			c := validationCluster()
+			c.Spec.Metrics = garagev1alpha1.MetricsConfig{
+				Enabled:  true,
+				Interval: "30s",
+				Labels:   map[string]string{"release": testPrometheusLabel},
+			}
+			Expect(k8sClient.Create(ctx, c)).To(Succeed())
+		})
+
+		It("rejects metrics with a malformed interval", func() {
+			c := validationCluster()
+			c.Spec.Metrics = garagev1alpha1.MetricsConfig{Enabled: true, Interval: "30 seconds"}
+			err := k8sClient.Create(ctx, c)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("spec.metrics.interval"))
+		})
 	})
 
 	Describe("GarageBucket", func() {

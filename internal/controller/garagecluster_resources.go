@@ -26,6 +26,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 
@@ -82,6 +84,19 @@ const (
 // secretKeyToken is the key under which generated admin-token / RPC secrets are stored.
 const secretKeyToken = "token"
 
+// podMonitorGVK identifies the Prometheus Operator PodMonitor type the operator creates when
+// metrics scraping is enabled. It is referenced as an unstructured object so the operator does
+// not depend on the prometheus-operator Go module for a single resource — and so a missing CRD
+// is a runtime no-op (feature-detected) rather than a build- or scheme-time requirement.
+var podMonitorGVK = schema.GroupVersionKind{Group: "monitoring.coreos.com", Version: "v1", Kind: "PodMonitor"}
+
+// PodMonitor scrape-endpoint settings for Garage's metrics. Garage serves Prometheus metrics
+// at /metrics over plain HTTP on its admin port.
+const (
+	metricsPath   = "/metrics"
+	metricsScheme = "http"
+)
+
 // annotationConfigHash stamps each pod template with a digest of the rendered garage.toml.
 // Garage reads its config only at startup and the operator mounts it from a ConfigMap, so a
 // ConfigMap edit alone would never restart the pods. Rolling the digest into the pod template
@@ -130,6 +145,7 @@ func headlessServiceName(c *garagev1alpha1.GarageCluster) string { return c.Name
 func s3ServiceName(c *garagev1alpha1.GarageCluster) string       { return c.Name + "-s3" }
 func webServiceName(c *garagev1alpha1.GarageCluster) string      { return c.Name + "-web" }
 func configMapName(c *garagev1alpha1.GarageCluster) string       { return c.Name + "-config" }
+func podMonitorName(c *garagev1alpha1.GarageCluster) string      { return c.Name + "-metrics" }
 
 func statefulSetName(c *garagev1alpha1.GarageCluster, pool *garagev1alpha1.NodePool) string {
 	return c.Name + "-" + pool.Name
@@ -314,6 +330,46 @@ func desiredS3Service(c *garagev1alpha1.GarageCluster) *corev1.Service {
 
 func desiredWebService(c *garagev1alpha1.GarageCluster) *corev1.Service {
 	return desiredClientService(c, webServiceName(c), "web", portWeb, c.Spec.Services.Web)
+}
+
+// desiredPodMonitor builds the PodMonitor that scrapes every Garage node's metrics. It selects
+// the cluster's pods (across all pools) and targets the admin container port, where Garage
+// serves /metrics in Prometheus format. The endpoint is unauthenticated: the admin port is only
+// reachable in-cluster (headless, never load-balanced) and no metrics_token is set on Garage.
+//
+// It is built as unstructured because the PodMonitor CRD may not be installed; see podMonitorGVK.
+func desiredPodMonitor(c *garagev1alpha1.GarageCluster) *unstructured.Unstructured {
+	endpoint := map[string]any{
+		"port":   portNameAdmin,
+		"path":   metricsPath,
+		"scheme": metricsScheme,
+	}
+	if c.Spec.Metrics.Interval != "" {
+		endpoint["interval"] = c.Spec.Metrics.Interval
+	}
+
+	pm := &unstructured.Unstructured{}
+	pm.SetGroupVersionKind(podMonitorGVK)
+	pm.SetNamespace(c.Namespace)
+	pm.SetName(podMonitorName(c))
+	pm.SetLabels(mergeLabels(clusterLabels(c), c.Spec.Metrics.Labels))
+	pm.Object["spec"] = map[string]any{
+		// No namespaceSelector: a PodMonitor defaults to selecting pods in its own namespace,
+		// which is exactly the cluster's pods.
+		"selector":            map[string]any{"matchLabels": toUnstructuredStringMap(clusterSelectorLabels(c))},
+		"podMetricsEndpoints": []any{endpoint},
+	}
+	return pm
+}
+
+// toUnstructuredStringMap converts a map[string]string into the map[string]any an
+// unstructured object requires for its nested fields (only JSON-native types are allowed).
+func toUnstructuredStringMap(m map[string]string) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // desiredStatefulSet builds the StatefulSet for a single node pool.

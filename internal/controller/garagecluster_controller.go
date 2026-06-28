@@ -47,6 +47,7 @@ const (
 	conditionPeersConnected      = "PeersConnected"
 	conditionLayoutApplied       = "LayoutApplied"
 	conditionLayoutChangePending = "LayoutChangePending"
+	conditionMetricsReady        = "MetricsReady"
 )
 
 // healthStatusHealthy is Garage's GetClusterHealth status when every storage node is
@@ -118,6 +119,7 @@ func defaultAdminClientFactory(baseURL, token string) (clusterAdmin, error) {
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=monitoring.coreos.com,resources=podmonitors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 
 // Reconcile drives the observed cluster toward the GarageCluster spec: it provisions the
@@ -148,6 +150,11 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.ensureWorkload(ctx, &cluster); err != nil {
 		return ctrl.Result{}, err
 	}
+
+	// Converge the metrics PodMonitor right after the workload exists: it scrapes the pods
+	// directly and does not depend on cluster readiness, so it is reconciled before the
+	// readiness gate and on every pass. It is best-effort and never gates Ready.
+	r.reconcileMetrics(ctx, &cluster, status)
 
 	// In-place storage growth runs after the workload exists but before the readiness gate: a
 	// grow orphan-deletes the StatefulSet so it can be recreated with the larger volume

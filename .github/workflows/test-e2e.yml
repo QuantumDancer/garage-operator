@@ -15,7 +15,7 @@ jobs:
     # Kind cluster. The specs are isolated by namespace, so the only constraint is
     # keeping the manager+metrics specs together (shared "manager" label). The four
     # shards are balanced so the heavy cluster-lifecycle specs are spread out:
-    #   light (manager+metrics plus the light bucket/key/maintenance specs),
+    #   light (manager+metrics plus the light bucket/key/maintenance/metrics specs),
     #   cluster (the 3-node bring-up plus the StorageClass-change migration),
     #   drain (plus the two-pool multi-zone bring-up), and the two data-size
     #   storage migrations (grow + shrink).
@@ -27,7 +27,7 @@ jobs:
       matrix:
         include:
           - shard: light
-            filter: "manager || bucket || key || maintenance || validation"
+            filter: "manager || bucket || key || maintenance || validation || metrics"
           - shard: cluster
             filter: "cluster || class"
           - shard: drain
