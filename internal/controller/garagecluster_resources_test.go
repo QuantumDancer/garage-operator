@@ -35,7 +35,7 @@ func newTestCluster() *garagev1alpha1.GarageCluster {
 	return &garagev1alpha1.GarageCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testClusterNS},
 		Spec: garagev1alpha1.GarageClusterSpec{
-			Image:             garagev1alpha1.GarageImage{Repository: "dxflrs/amd64_garage", Tag: "v2.0.0"},
+			Image:             garagev1alpha1.GarageImage{Repository: "dxflrs/amd64_garage", Tag: "v2.3.0"},
 			DBEngine:          "lmdb",
 			BlockSize:         1048576,
 			ReplicationFactor: 1,
@@ -138,7 +138,7 @@ var _ = Describe("GarageCluster resource builders", func() {
 			Expect(ss.Spec.Selector.MatchLabels).To(HaveKeyWithValue(labelPool, "default"))
 
 			c := ss.Spec.Template.Spec.Containers[0]
-			Expect(c.Image).To(Equal("dxflrs/amd64_garage:v2.0.0"))
+			Expect(c.Image).To(Equal("dxflrs/amd64_garage:v2.3.0"))
 
 			env := map[string]string{}
 			for _, e := range c.Env {
@@ -157,7 +157,7 @@ var _ = Describe("GarageCluster resource builders", func() {
 		It("falls back to the default image when spec.image is omitted", func() {
 			cluster.Spec.Image = garagev1alpha1.GarageImage{}
 			ss := desiredStatefulSet(cluster, &cluster.Spec.NodePools[0])
-			Expect(ss.Spec.Template.Spec.Containers[0].Image).To(Equal("dxflrs/amd64_garage:v2.0.0"))
+			Expect(ss.Spec.Template.Spec.Containers[0].Image).To(Equal("dxflrs/amd64_garage:v2.3.0"))
 		})
 
 		It("derives PVC templates from the pool storage spec", func() {

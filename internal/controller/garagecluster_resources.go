@@ -114,7 +114,7 @@ func configHash(toml string) string {
 // honour "defaulted by the operator if omitted".
 const (
 	defaultImageRepository = "dxflrs/amd64_garage"
-	defaultImageTag        = "v2.0.0"
+	defaultImageTag        = "v2.3.0"
 )
 
 // defaultS3Region is used when spec.s3.api.region is omitted. Garage's [s3_api] section

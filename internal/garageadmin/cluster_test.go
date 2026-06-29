@@ -72,7 +72,7 @@ func (f *fakeAdmin) server() *httptest.Server {
 				NodeId         string    `json:"nodeId"`
 				RustVersion    string    `json:"rustVersion"`
 			}{
-				f.nodeID: {NodeId: f.nodeID, DbEngine: "lmdb", GarageVersion: "v2.0.0", RustVersion: "1.0"},
+				f.nodeID: {NodeId: f.nodeID, DbEngine: "lmdb", GarageVersion: "v2.3.0", RustVersion: "1.0"},
 			}
 			f.encode(w, resp)
 		case "/v2/ConnectClusterNodes":
