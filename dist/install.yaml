@@ -538,7 +538,7 @@ spec:
                     description: repository is the container image repository.
                     type: string
                   tag:
-                    default: v2.0.0
+                    default: v2.3.0
                     description: tag is the image tag. Pinned by the user; defaulted
                       by the operator if omitted.
                     type: string

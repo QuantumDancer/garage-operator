@@ -49,7 +49,7 @@ const metricsRoleBindingName = "garage-operator-metrics-binding"
 
 // garageImage is the Garage container image the single-node e2e cluster runs. It is preloaded
 // into Kind so the test does not depend on a live pull at pod-start time.
-const garageImage = "dxflrs/amd64_garage:v2.0.0"
+const garageImage = "dxflrs/amd64_garage:v2.3.0"
 
 // ContinueOnFailure keeps an unrelated spec failure (e.g. the metrics curl pod flaking on
 // cluster-DNS warm-up) from skipping the rest of this Ordered container — the GarageCluster

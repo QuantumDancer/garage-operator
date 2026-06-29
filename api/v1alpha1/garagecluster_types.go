@@ -31,7 +31,7 @@ type GarageImage struct {
 	Repository string `json:"repository,omitempty"`
 
 	// tag is the image tag. Pinned by the user; defaulted by the operator if omitted.
-	// +kubebuilder:default="v2.0.0"
+	// +kubebuilder:default="v2.3.0"
 	// +optional
 	Tag string `json:"tag,omitempty"`
 }
