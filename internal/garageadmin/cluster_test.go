@@ -223,71 +223,6 @@ func TestConnectNodesSurfacesPerPeerFailure(t *testing.T) {
 	}
 }
 
-func TestEnsureLayoutAssignsRoleOnFreshCluster(t *testing.T) {
-	fake := &fakeAdmin{
-		t:      t,
-		layout: GetClusterLayoutResponse{Version: 0, Roles: []LayoutNodeRole{}},
-	}
-	client := newTestClient(t, fake)
-
-	applied, version, err := client.EnsureLayout(context.Background(), []DesiredRole{
-		{NodeID: nodeID1, Zone: zoneDefault, Capacity: 1 << 40},
-	})
-	if err != nil {
-		t.Fatalf("EnsureLayout: %v", err)
-	}
-	if !applied {
-		t.Error("applied = false, want true on a fresh cluster")
-	}
-	if version != 1 {
-		t.Errorf("version = %d, want 1", version)
-	}
-	if fake.updateCalls != 1 || fake.applyCalls != 1 {
-		t.Fatalf("update/apply calls = %d/%d, want 1/1", fake.updateCalls, fake.applyCalls)
-	}
-	if got := fake.appliedVersions[0]; got != 1 {
-		t.Errorf("applied version = %d, want 1 (current+1)", got)
-	}
-
-	// Verify the staged change carried the derived capacity and zone.
-	role, err := (*fake.updateBodies[0].Roles)[0].AsNodeRoleChangeRequest1()
-	if err != nil {
-		t.Fatalf("decode staged role: %v", err)
-	}
-	if role.Id != nodeID1 || role.Zone != "default" || role.Capacity == nil || *role.Capacity != 1<<40 {
-		t.Errorf("staged role = %+v, want id=node-1 zone=default capacity=2^40", role)
-	}
-}
-
-func TestEnsureLayoutIdempotentWhenConverged(t *testing.T) {
-	fake := &fakeAdmin{
-		t: t,
-		layout: GetClusterLayoutResponse{
-			Version: 5,
-			Roles: []LayoutNodeRole{
-				{Id: nodeID1, Zone: zoneDefault, Capacity: ptrInt64(1 << 40)},
-			},
-		},
-	}
-	client := newTestClient(t, fake)
-
-	applied, version, err := client.EnsureLayout(context.Background(), []DesiredRole{
-		{NodeID: nodeID1, Zone: zoneDefault, Capacity: 1 << 40},
-	})
-	if err != nil {
-		t.Fatalf("EnsureLayout: %v", err)
-	}
-	if applied {
-		t.Error("applied = true, want false when layout already matches")
-	}
-	if version != 5 {
-		t.Errorf("version = %d, want 5 (unchanged)", version)
-	}
-	if fake.updateCalls != 0 || fake.applyCalls != 0 {
-		t.Errorf("update/apply calls = %d/%d, want 0/0 on a converged cluster", fake.updateCalls, fake.applyCalls)
-	}
-}
-
 func TestPlanLayoutDetectsRemovalAndAdditive(t *testing.T) {
 	// node-1 is already in the layout and stays; node-stale is in the layout but no longer
 	// desired (a removal); node-new is desired but absent (an additive change).
@@ -620,28 +555,5 @@ func TestZoneRedundancyValueEqual(t *testing.T) {
 				t.Errorf("%+v.Equal(%+v) = %v, want %v", tc.a, tc.b, got, tc.want)
 			}
 		})
-	}
-}
-
-func TestEnsureLayoutRestagesOnCapacityChange(t *testing.T) {
-	fake := &fakeAdmin{
-		t: t,
-		layout: GetClusterLayoutResponse{
-			Version: 2,
-			Roles: []LayoutNodeRole{
-				{Id: nodeID1, Zone: zoneDefault, Capacity: ptrInt64(1 << 39)},
-			},
-		},
-	}
-	client := newTestClient(t, fake)
-
-	applied, version, err := client.EnsureLayout(context.Background(), []DesiredRole{
-		{NodeID: nodeID1, Zone: zoneDefault, Capacity: 1 << 40},
-	})
-	if err != nil {
-		t.Fatalf("EnsureLayout: %v", err)
-	}
-	if !applied || version != 3 {
-		t.Errorf("applied/version = %v/%d, want true/3 after capacity change", applied, version)
 	}
 }

@@ -56,6 +56,11 @@ type fakeLayout struct {
 	applyCalls  int
 	previewMsg  []string
 
+	// ops records the layout mutating calls in order ("revert", "stage", "apply") across the
+	// per-pod clients a reconcile creates, so a test can assert a revert precedes the stage in an
+	// apply path (REVIEW.md #8).
+	ops []string
+
 	// redundancy is the applied zone-redundancy parameter, defaulting to Garage's Maximum.
 	// redundancyCalls counts how many times the controller applied a change to it.
 	redundancy      garageadmin.ZoneRedundancyValue
@@ -131,6 +136,19 @@ type fakeClusterAdmin struct {
 	// health, when set, overrides the default healthy response so migration tests can drive the
 	// partition counts the re-replication wait reads.
 	health *garageadmin.GetClusterHealthResponse
+
+	// planErr, when set, makes PlanLayout fail so a test can drive the reconcileLayout error
+	// path (the first Admin call reconcileLayout makes).
+	planErr error
+
+	// healthErr, when set, makes Health fail so a test can drive the swallowed-health-error
+	// path: the cached status.Health must be invalidated rather than left stale.
+	healthErr error
+
+	// unreachable, keyed by node id, makes NodeID fail for the matching pod so a test can
+	// simulate a single down node while the rest of the cluster keeps answering. A shared map
+	// across the per-pod clients one reconcile creates lets a test mark exactly one node down.
+	unreachable map[string]bool
 }
 
 func (f *fakeClusterAdmin) CreateMetadataSnapshot(context.Context, string) (garageadmin.MultiNodeResult, error) {
@@ -165,7 +183,12 @@ func (f *fakeClusterAdmin) ListActiveWorkers(context.Context, string) ([]garagea
 	return nil, nil
 }
 
-func (f *fakeClusterAdmin) NodeID(context.Context) (string, error) { return f.nodeID, nil }
+func (f *fakeClusterAdmin) NodeID(context.Context) (string, error) {
+	if f.unreachable[f.nodeID] {
+		return "", fmt.Errorf("admin API unreachable")
+	}
+	return f.nodeID, nil
+}
 
 func (f *fakeClusterAdmin) ConnectNodes(_ context.Context, peers []string) error {
 	if f.recorder != nil {
@@ -176,10 +199,14 @@ func (f *fakeClusterAdmin) ConnectNodes(_ context.Context, peers []string) error
 }
 
 func (f *fakeClusterAdmin) PlanLayout(_ context.Context, desired []garageadmin.DesiredRole) (*garageadmin.LayoutPlan, error) {
+	if f.planErr != nil {
+		return nil, f.planErr
+	}
 	return f.layout.plan(desired), nil
 }
 
 func (f *fakeClusterAdmin) StageLayoutChanges(context.Context, []garageadmin.NodeRoleChangeRequest) error {
+	f.layout.ops = append(f.layout.ops, "stage")
 	return nil
 }
 
@@ -188,11 +215,15 @@ func (f *fakeClusterAdmin) PreviewStagedChanges(context.Context) ([]string, erro
 }
 
 func (f *fakeClusterAdmin) ApplyLayout(_ context.Context, version int64) error {
+	f.layout.ops = append(f.layout.ops, "apply")
 	f.layout.apply(version)
 	return nil
 }
 
-func (f *fakeClusterAdmin) RevertStagedChanges(context.Context) error { return nil }
+func (f *fakeClusterAdmin) RevertStagedChanges(context.Context) error {
+	f.layout.ops = append(f.layout.ops, "revert")
+	return nil
+}
 
 func (f *fakeClusterAdmin) CurrentZoneRedundancy(context.Context) (garageadmin.ZoneRedundancyValue, error) {
 	return f.layout.redundancy, nil
@@ -250,6 +281,9 @@ func newBasicClusterSpec(replicationFactor, replicas int32) garagev1alpha1.Garag
 }
 
 func (f *fakeClusterAdmin) Health(context.Context) (*garageadmin.GetClusterHealthResponse, error) {
+	if f.healthErr != nil {
+		return nil, f.healthErr
+	}
 	if f.health != nil {
 		return f.health, nil
 	}
@@ -382,6 +416,40 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 
+	It("persists Ready=False when a layout reconcile errors", func() {
+		// Regression guard for REVIEW.md #9: an error from a reconcile* step must be written to
+		// status before Reconcile returns, otherwise kubectl keeps showing a stale Ready=True
+		// while the operator error-loops. PlanLayout is the first call reconcileLayout makes, so
+		// failing it drives the LayoutError path without disturbing the shared fake layout.
+		By("provisioning the workload and marking the StatefulSet ready so the reconcile reaches the layout step")
+		_, err := reconcilerWithFakeAdmin().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: defaultSSName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = 1
+		ss.Status.ReadyReplicas = 1
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+
+		failing := &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(string, string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeSelf, recorder: mesh, layout: layout, planErr: fmt.Errorf("admin API unreachable")}, nil
+			},
+		}
+
+		_, err = failing.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).To(HaveOccurred())
+
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		ready := meta.FindStatusCondition(cluster.Status.Conditions, conditionReady)
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+		Expect(ready.Reason).To(Equal("LayoutError"))
+	})
+
 	It("rolls the StatefulSet pod template when the Garage config changes", func() {
 		ssName := types.NamespacedName{Name: defaultSSName, Namespace: resourceNamespace}
 		var before appsv1.StatefulSet
@@ -504,6 +572,8 @@ var _ = Describe("GarageCluster multi-node mesh", Ordered, func() {
 // createPVC simulates a volumeClaimTemplates PVC that a real StatefulSet controller would
 // create. envtest runs no such controller, so the drain tests stand them up explicitly to
 // assert the operator reclaims the right ones.
+//
+//nolint:unparam // namespace is a parameter for symmetry with pvcExists; tests use "default".
 func createPVC(ctx context.Context, namespace, name string) {
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
@@ -605,6 +675,11 @@ var _ = Describe("GarageCluster destructive layout (scale-down)", Ordered, func(
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
 		Expect(*ss.Spec.Replicas).To(Equal(int32(3)))
 
+		By("not reclaiming the surplus node's PVCs while the drain is still in the layout (REVIEW.md #6 safety)")
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-2", vol, ssName))).To(BeTrue())
+		}
+
 		By("reporting LayoutChangePending and not applying the drain")
 		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionLayoutChangePending)).To(BeTrue())
@@ -626,6 +701,40 @@ var _ = Describe("GarageCluster destructive layout (scale-down)", Ordered, func(
 
 		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionLayoutChangePending)).To(BeTrue())
+	})
+
+	It("refuses an approved drain when cluster health cannot be confirmed", func() {
+		// Regression guard for REVIEW.md #1: a transient Health() error must invalidate the
+		// cached status.Health rather than leave the stale "healthy" value in place, otherwise
+		// the destructive-drain guardrail acts on stale data and drains a node from a cluster
+		// that may have degraded. The approval is already in place, so only the health guardrail
+		// can hold the drain back.
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Annotations = map[string]string{annotationApproveLayout: "2"}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		unhealthy := &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), recorder: mesh, layout: layout, healthErr: fmt.Errorf("health endpoint timeout")}, nil
+			},
+		}
+
+		_, err := unhealthy.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("not applying the drain")
+		Expect(layout.applyCalls).To(Equal(1))
+
+		By("invalidating the cached health and blocking the change")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(cluster.Status.Health).To(BeNil())
+		blocked := meta.FindStatusCondition(cluster.Status.Conditions, conditionLayoutChangePending)
+		Expect(blocked).NotTo(BeNil())
+		Expect(blocked.Status).To(Equal(metav1.ConditionFalse))
+		Expect(blocked.Reason).To(Equal(reasonBlocked))
 	})
 
 	It("drains the node and reclaims its PVCs once approved", func() {
@@ -659,6 +768,117 @@ var _ = Describe("GarageCluster destructive layout (scale-down)", Ordered, func(
 		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionLayoutApplied)).To(BeTrue())
 		Expect(cluster.Status.Layout.Version).To(Equal(int64(2)))
 		Expect(cluster.Status.Layout.Nodes).To(HaveLen(2))
+	})
+})
+
+var _ = Describe("GarageCluster day-2 ops with one unreachable node", Ordered, func() {
+	// Regression guard for REVIEW.md #3: a single unreachable node must not freeze every other
+	// day-2 operation. discoverNodes used to bail on the first node whose admin API was down, so
+	// Reconcile returned before the layout step and a *different* node the user had removed from
+	// spec never got drained. The fix proceeds on the reachable subset while keeping the
+	// unreachable-but-still-desired node in the layout set so it is never mistaken for a removal
+	// and drained (which would lose redundancy on a node that is merely temporarily down).
+	const (
+		resourceName      = "unreach"
+		resourceNamespace = "default"
+		ssName            = "unreach-default"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	mesh := &meshRecorder{}
+	// down is shared across the per-pod clients each reconcile creates, so flipping one entry
+	// takes exactly that node's admin API offline mid-suite.
+	down := map[string]bool{}
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), recorder: mesh, layout: layout, unreachable: down}, nil
+			},
+		}
+	}
+
+	markReady := func(replicas int32) {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = replicas
+		ss.Status.ReadyReplicas = replicas
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(3, 3),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+		By("converging the 3-node cluster to Ready while every node is reachable")
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		markReady(3)
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+		Expect(layout.applied).To(HaveLen(3))
+
+		By("standing up the PVCs the StatefulSet controller would have created")
+		for ord := range 3 {
+			for _, vol := range []string{volumeNameMeta, volumeNameData} {
+				createPVC(ctx, resourceNamespace, fmt.Sprintf("%s-%s-%d", vol, ssName, ord))
+			}
+		}
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("drains a removed node while a different node is down, without draining the down node", func() {
+		By("taking node-1's admin API offline")
+		down[nodeIDFromBaseURL("http://unreach-default-1.")] = true
+
+		By("removing node-2 from spec and pre-approving its drain (target version 2)")
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Spec.NodePools[0].Replicas = 2
+		cluster.Annotations = map[string]string{annotationApproveLayout: "2"}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("proceeding to the drain on the reachable subset instead of bailing on the down node")
+		Expect(layout.applyCalls).To(Equal(2))
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		Expect(*ss.Spec.Replicas).To(Equal(int32(2)))
+
+		By("draining only the removed node's PVCs, keeping the down node's and the survivor's")
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-2", vol, ssName))).To(BeFalse())
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-1", vol, ssName))).To(BeTrue())
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-0", vol, ssName))).To(BeTrue())
+		}
+
+		By("keeping the unreachable node in the applied layout so it is never treated as a removal")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(cluster.Status.Layout.Version).To(Equal(int64(2)))
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(2))
+		laidOut := map[string]struct{}{}
+		for _, n := range cluster.Status.Layout.Nodes {
+			laidOut[n.NodeID] = struct{}{}
+		}
+		Expect(laidOut).To(HaveKey("id-unreach-default-1"), "the down node must remain in the layout")
+		Expect(laidOut).To(HaveKey("id-unreach-default-0"))
+		Expect(laidOut).NotTo(HaveKey("id-unreach-default-2"), "only the spec-removed node should be drained")
 	})
 })
 
@@ -828,5 +1048,312 @@ var _ = Describe("GarageCluster destructive layout (whole-pool removal)", Ordere
 		By("reporting a single-node layout")
 		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
 		Expect(cluster.Status.Layout.Nodes).To(HaveLen(1))
+	})
+})
+
+var _ = Describe("GarageCluster surplus-workload teardown retried in the additive branch", Ordered, func() {
+	// Regression guard for REVIEW.md #6: drained-workload teardown (scaling a shrunk pool down and
+	// reclaiming its orphaned PVCs) used to run ONLY right after an approved destructive
+	// ApplyLayout. If that teardown failed partway, the next PlanLayout was non-destructive, so
+	// reconcileLayout took the additive branch forever and never re-entered teardown — the surplus
+	// pods/PVCs leaked permanently. The fix also runs reconcileRemovedWorkload at the end of the
+	// additive branch, where it is safe (the applied layout already excludes every spec-surplus
+	// node) and idempotent, so a half-finished teardown is retried on an ordinary later pass.
+	const (
+		resourceName      = "leak"
+		resourceNamespace = "default"
+		ssName            = "leak-default"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	mesh := &meshRecorder{}
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), recorder: mesh, layout: layout}, nil
+			},
+		}
+	}
+
+	markReady := func(replicas int32) {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = replicas
+		ss.Status.ReadyReplicas = replicas
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(3, 3),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+		By("converging the 3-node cluster to Ready")
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		markReady(3)
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+		Expect(layout.applied).To(HaveLen(3))
+
+		By("standing up the PVCs the StatefulSet controller would have created")
+		for ord := range 3 {
+			for _, vol := range []string{volumeNameMeta, volumeNameData} {
+				createPVC(ctx, resourceNamespace, fmt.Sprintf("%s-%s-%d", vol, ssName, ord))
+			}
+		}
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("scales a leaked surplus pool down and reclaims its PVCs on an ordinary non-destructive pass", func() {
+		By("simulating a half-finished teardown: spec is shrunk and node-2 is already out of the layout, while the StatefulSet still runs 3 replicas and node-2's PVCs linger")
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Spec.NodePools[0].Replicas = 2
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+		// ensureStatefulSet refuses to scale a live StatefulSet down, so it stays at 3 replicas and
+		// still reads as ready; dropping node-2 from the applied layout models the drain that a
+		// prior approved pass committed before its workload teardown failed and left the surplus.
+		delete(layout.applied, "id-"+ssName+"-2")
+		Expect(layout.applied).To(HaveLen(2))
+
+		By("reconciling: PlanLayout sees applied == desired, so this is the non-destructive additive branch")
+		applyCallsBefore := layout.applyCalls
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("not staging or applying any layout change (the teardown is workload-only)")
+		Expect(layout.applyCalls).To(Equal(applyCallsBefore))
+
+		By("scaling the StatefulSet down to the desired replica count in the additive branch")
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		Expect(*ss.Spec.Replicas).To(Equal(int32(2)))
+
+		By("reclaiming the leaked node's PVCs while keeping the survivors'")
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-2", vol, ssName))).To(BeFalse())
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-0", vol, ssName))).To(BeTrue())
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-1", vol, ssName))).To(BeTrue())
+		}
+
+		By("reporting the converged 2-node layout and staying Ready")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(2))
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady)).To(BeTrue())
+	})
+})
+
+var _ = Describe("GarageCluster additive layout apply reverts stale staged changes first", Ordered, func() {
+	// Regression guard for REVIEW.md #8: the additive apply path staged and applied without first
+	// reverting, unlike every other apply path. A prior reconcile that staged changes then crashed
+	// before ApplyLayout leaves them staged; PlanLayout diffs only the APPLIED layout, so it never
+	// sees them and never re-stages or reverts them. A later additive change would then
+	// ApplyLayout(version+1) over the UNION, committing the abandoned change the user never
+	// approved. The fix calls RevertStagedChanges before StageLayoutChanges, so the apply commits
+	// exactly this plan. This asserts the ordering on the first converge (itself an additive apply).
+	const (
+		resourceName      = "addrevert"
+		resourceNamespace = "default"
+		ssName            = "addrevert-default"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), layout: layout}, nil
+			},
+		}
+	}
+
+	markReady := func() {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = 1
+		ss.Status.ReadyReplicas = 1
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(1, 1),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("reverts staged changes before staging this plan's additive changes", func() {
+		By("provisioning the workload (pods not yet ready, so the layout step is not reached)")
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.ops).To(BeEmpty(), "no layout mutation before pods are ready")
+
+		By("marking the StatefulSet ready and reconciling into the additive apply")
+		markReady()
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+
+		By("calling RevertStagedChanges before StageLayoutChanges in the additive apply")
+		revertIdx := -1
+		stageIdx := -1
+		for i, op := range layout.ops {
+			if op == "revert" && revertIdx == -1 {
+				revertIdx = i
+			}
+			if op == "stage" && stageIdx == -1 {
+				stageIdx = i
+			}
+		}
+		Expect(revertIdx).NotTo(Equal(-1), "additive apply must revert stale staged changes")
+		Expect(stageIdx).NotTo(Equal(-1), "additive apply must stage this plan's changes")
+		Expect(revertIdx).To(BeNumerically("<", stageIdx), "revert must precede stage so the apply commits only this plan, never a stale union")
+	})
+})
+
+var _ = Describe("GarageCluster blocked storage migration does not freeze unrelated ops", Ordered, func() {
+	// Regression guard for REVIEW.md #5: a storage migration refused by a guardrail used to return
+	// active=true, so Reconcile reported Ready/StorageMigrating and returned BEFORE the generic
+	// layout/zone/maintenance steps — freezing every unrelated cluster operation until the user
+	// reverted the impossible storage edit. The fix pins the blocked pool's capacity to its current
+	// applied value and lets the reconcile fall through, so only the affected pool's capacity change
+	// is suppressed. The pin is the safety half: reconcileLayout must NOT advertise the pool's new
+	// (unmigrated) size to Garage — a blocked grow would otherwise claim more disk than the node has.
+	const (
+		resourceName      = "smblock"
+		resourceNamespace = "default"
+		ssName            = "smblock-default"
+		nodeID            = "id-smblock-default-0"
+		podZeroName       = "smblock-default-0"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), layout: layout}, nil
+			},
+		}
+	}
+
+	markReady := func() {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = 1
+		ss.Status.ReadyReplicas = 1
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		// A single-node rf=1 cluster: rf<2 is exactly the guardrail that refuses a migration drain.
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(1, 1),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+		By("converging the cluster to Ready with a 1Gi data volume laid out")
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		markReady()
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(1))
+		Expect(cluster.Status.Layout.Nodes[0].Capacity.Cmp(apiresource.MustParse("1Gi"))).To(Equal(0))
+
+		By("standing up the live PVCs the StatefulSet controller would have created (at 1Gi)")
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			createPVC(ctx, resourceNamespace, fmt.Sprintf("%s-%s-0", vol, ssName))
+		}
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("applies an unrelated zone-redundancy change while refusing the impossible shrink", func() {
+		By("shrinking the data volume (selects a migration the rf=1 guardrail refuses) and changing zone redundancy in the same edit")
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Spec.NodePools[0].Storage.Data.Size = apiresource.MustParse("512Mi")
+		cluster.Spec.ZoneRedundancy = &garagev1alpha1.ZoneRedundancy{
+			Mode: garagev1alpha1.ZoneRedundancyAtLeast, AtLeast: 1,
+		}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		redundancyBefore := layout.redundancyCalls
+		applyBefore := layout.applyCalls
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("refusing the shrink: StorageChangePending=False/Blocked")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		blocked := meta.FindStatusCondition(cluster.Status.Conditions, conditionStorageChangePending)
+		Expect(blocked).NotTo(BeNil())
+		Expect(blocked.Status).To(Equal(metav1.ConditionFalse))
+		Expect(blocked.Reason).To(Equal(reasonBlocked))
+
+		By("no longer freezing the reconcile: the unrelated zone-redundancy change is applied")
+		Expect(layout.redundancyCalls).To(Equal(redundancyBefore + 1))
+
+		By("not applying any layout change for the blocked pool")
+		Expect(layout.applyCalls).To(Equal(applyBefore))
+
+		By("pinning the blocked pool's layout capacity to its current 1Gi value, not advancing it to the new 512Mi")
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(1))
+		Expect(cluster.Status.Layout.Nodes[0].Pod).To(Equal(podZeroName))
+		Expect(cluster.Status.Layout.Nodes[0].Capacity.Cmp(apiresource.MustParse("1Gi"))).To(Equal(0))
+
+		By("advertising the pinned 1Gi capacity to Garage's PlanLayout, never the unmigrated 512Mi")
+		var role *garageadmin.DesiredRole
+		for i := range layout.lastDesired {
+			if layout.lastDesired[i].NodeID == nodeID {
+				role = &layout.lastDesired[i]
+			}
+		}
+		Expect(role).NotTo(BeNil())
+		oneGi := apiresource.MustParse("1Gi")
+		Expect(role.Capacity).To(Equal(oneGi.Value()))
+
+		By("keeping the cluster Ready: it is healthy, only the storage edit is refused")
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady)).To(BeTrue())
 	})
 })

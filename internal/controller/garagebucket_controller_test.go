@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -64,6 +65,10 @@ func newFakeBucketAdmin() *fakeBucketAdmin {
 		buckets: map[string]*garageadmin.GetBucketInfoResponse{},
 		aliases: map[string]string{},
 	}
+}
+
+func (f *fakeBucketAdmin) NodeID(context.Context) (string, error) {
+	return "fake-node", nil
 }
 
 func (f *fakeBucketAdmin) GetBucketByID(_ context.Context, id string) (*garageadmin.GetBucketInfoResponse, bool, error) {
@@ -545,6 +550,70 @@ func TestBucketReconcileRevokesUnlistedGrant(t *testing.T) {
 	}
 }
 
+// TestReconcileGrantsKeepsUnresolvedKeyPermissions covers REVIEW.md #2: a key still listed in
+// spec.Grants but unresolvable this pass (e.g. its GarageKey was deleted under deletionPolicy
+// Retain, or it is mid-rotation with an empty status.KeyID) has no access key id, so it is
+// omitted from desiredGrants. The revoke sweep must not mistake that omission for "removed from
+// spec" and strip the key's live Garage permissions.
+func TestReconcileGrantsKeepsUnresolvedKeyPermissions(t *testing.T) {
+	admin := newFakeBucketAdmin()
+	// No GarageKey CR is seeded, so the grant's keyRef can never resolve.
+	r, _ := newBucketReconciler(t, admin)
+
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{
+		Grants: []garagev1alpha1.BucketGrant{{KeyRef: garagev1alpha1.KeyReference{Name: testKeyName}, Read: true, Write: true}},
+	})
+	info := &garageadmin.GetBucketInfoResponse{
+		Id: testBucketID,
+		Keys: []garageadmin.GetBucketInfoKey{{
+			AccessKeyId: testGarageKeyID,
+			Permissions: garageadmin.ApiBucketKeyPerm{Read: ptr.To(true), Write: ptr.To(true)},
+		}},
+	}
+	// fakeBucketAdmin.DenyBucketKey writes its bookkeeping through admin.buckets[id], so the
+	// bucket must be registered there even though the call under test takes info directly.
+	admin.buckets[testBucketID] = info
+
+	err := r.reconcileGrantsAndAliases(context.Background(), admin, bucket, info)
+	if !errors.Is(err, errKeyNotReady) {
+		t.Fatalf("reconcileGrantsAndAliases error = %v, want errKeyNotReady", err)
+	}
+	if len(admin.denyCalls) != 0 {
+		t.Fatalf("denyCalls = %v, want none (key unresolved this pass, its live grant must survive)", admin.denyCalls)
+	}
+}
+
+// TestReconcileLocalAliasesKeepsUnresolvedKeyAlias is the local-alias twin of
+// TestReconcileGrantsKeepsUnresolvedKeyPermissions: same unresolvable-key setup, but exercising
+// the alias removal sweep instead of the grant revoke sweep.
+func TestReconcileLocalAliasesKeepsUnresolvedKeyAlias(t *testing.T) {
+	admin := newFakeBucketAdmin()
+	// No GarageKey CR is seeded, so the alias's keyRef can never resolve.
+	r, _ := newBucketReconciler(t, admin)
+
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{
+		LocalAliases: []garagev1alpha1.LocalAlias{{KeyRef: garagev1alpha1.KeyReference{Name: testKeyName}, Alias: "myalias"}},
+	})
+	info := &garageadmin.GetBucketInfoResponse{
+		Id: testBucketID,
+		Keys: []garageadmin.GetBucketInfoKey{{
+			AccessKeyId:        testGarageKeyID,
+			BucketLocalAliases: []string{"myalias"},
+		}},
+	}
+	// fakeBucketAdmin.RemoveBucketLocalAlias writes its bookkeeping through admin.buckets[id], so
+	// the bucket must be registered there even though the call under test takes info directly.
+	admin.buckets[testBucketID] = info
+
+	err := r.reconcileGrantsAndAliases(context.Background(), admin, bucket, info)
+	if !errors.Is(err, errKeyNotReady) {
+		t.Fatalf("reconcileGrantsAndAliases error = %v, want errKeyNotReady", err)
+	}
+	if len(admin.removedLocalAlias) != 0 {
+		t.Fatalf("removedLocalAlias = %v, want none (key unresolved this pass, its live alias must survive)", admin.removedLocalAlias)
+	}
+}
+
 func TestBucketDeleteRefusesNonEmptyBucket(t *testing.T) {
 	cluster, secret := readyCluster()
 	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{DeletionPolicy: garagev1alpha1.BucketDeletionDelete})
@@ -582,5 +651,144 @@ func TestBucketDeleteRefusesNonEmptyBucket(t *testing.T) {
 		}
 	default:
 		t.Error("expected a DeletionBlocked event to be recorded")
+	}
+}
+
+// TestBucketDeleteByAliasWhenBucketIDLost is the regression test for REVIEW.md #13:
+// status.BucketID can go missing without the Garage bucket itself ever having been removed (a
+// create whose status write never landed, or an external status reset). Before the fix,
+// reconcileDelete treated an empty id under DeletionPolicy: Delete as "nothing to delete" and
+// dropped the finalizer outright, orphaning the bucket and its data. With a global alias still on
+// the spec, the bucket is findable by that alias and must be deleted through it instead.
+func TestBucketDeleteByAliasWhenBucketIDLost(t *testing.T) {
+	cluster, secret := readyCluster()
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{
+		DeletionPolicy: garagev1alpha1.BucketDeletionDelete,
+		GlobalAliases:  []string{testBucketName},
+	})
+	// bucket.Status.BucketID is left at its zero value: the lost-id case under test.
+	admin := newFakeBucketAdmin()
+	admin.buckets[testBucketID] = &garageadmin.GetBucketInfoResponse{Id: testBucketID, Objects: 0}
+	admin.aliases[testBucketName] = testBucketID
+	r, c := newBucketReconciler(t, admin, bucket, cluster, secret)
+
+	if err := c.Delete(context.Background(), bucket); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	got := getBucket(t, c)
+
+	if _, err := r.reconcileDelete(context.Background(), got); err != nil {
+		t.Fatalf("reconcileDelete: %v", err)
+	}
+
+	if admin.deleteCalls != 1 {
+		t.Errorf("deleteCalls = %d, want 1 (bucket resolved via its global alias)", admin.deleteCalls)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: testBucketName, Namespace: testBucketNS}, &garagev1alpha1.GarageBucket{}); !apierrors.IsNotFound(err) {
+		t.Errorf("bucket still present after deletion: err=%v", err)
+	}
+}
+
+// TestBucketDeleteUnfindableDropsFinalizer documents the boundary TestBucketDeleteByAliasWhenBucketIDLost
+// relies on: with no recorded id AND no global alias, the bucket has no handle to look it up by
+// (an aliasless bucket whose id was lost is unrecoverable), so reconcileDelete must still drop the
+// finalizer without calling DeleteBucket. This passes both before and after the fix; it pins down
+// the case the fallback is deliberately NOT meant to cover.
+func TestBucketDeleteUnfindableDropsFinalizer(t *testing.T) {
+	cluster, secret := readyCluster()
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{DeletionPolicy: garagev1alpha1.BucketDeletionDelete})
+	// bucket.Status.BucketID is left at its zero value and spec.GlobalAliases is empty: unfindable.
+	admin := newFakeBucketAdmin()
+	r, c := newBucketReconciler(t, admin, bucket, cluster, secret)
+
+	if err := c.Delete(context.Background(), bucket); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	got := getBucket(t, c)
+
+	if _, err := r.reconcileDelete(context.Background(), got); err != nil {
+		t.Fatalf("reconcileDelete: %v", err)
+	}
+
+	if admin.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0 (bucket is unfindable)", admin.deleteCalls)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: testBucketName, Namespace: testBucketNS}, &garagev1alpha1.GarageBucket{}); !apierrors.IsNotFound(err) {
+		t.Errorf("bucket still present after finalizer drop: err=%v", err)
+	}
+}
+
+// downBucketAdmin simulates a node that has stopped answering: NodeID and the bucket lookup
+// both fail, so a controller that targets it cannot converge. Embedding a nil bucketAdmin makes
+// any other method call panic loudly, since converge should never get far enough to attempt one.
+type downBucketAdmin struct {
+	bucketAdmin
+}
+
+func (d *downBucketAdmin) NodeID(context.Context) (string, error) {
+	return "", fmt.Errorf("node unreachable")
+}
+
+func (d *downBucketAdmin) GetBucketByID(context.Context, string) (*garageadmin.GetBucketInfoResponse, bool, error) {
+	return nil, false, fmt.Errorf("node unreachable")
+}
+
+// TestBucketReconcileFailsOverToReachableNode is the regression test for REVIEW.md #10: pinning
+// every bucket admin call to pool-0/pod-0 makes that one pod a single point of failure for the
+// whole cluster's bucket reconciliation, even though any laid-out node can serve the cluster-wide
+// admin API. status.layout.nodes lists the down pod-0 first and a healthy pod-1 second; a fixed
+// reconciler must fail over to pod-1 instead of giving up after pod-0.
+func TestBucketReconcileFailsOverToReachableNode(t *testing.T) {
+	cluster, secret := readyCluster()
+	pod0 := testClusterName + "-" + testPoolName + "-0"
+	pod1 := testClusterName + "-" + testPoolName + "-1"
+	// Only Pod feeds clusterAdminBaseURLs; Zone/Capacity/Role are irrelevant to this path and
+	// left at their zero value to keep the fixture focused on what the test exercises.
+	cluster.Status.Layout = &garagev1alpha1.LayoutStatus{
+		Version: 1,
+		Nodes: []garagev1alpha1.LayoutNodeStatus{
+			{Pod: pod0, NodeID: "node-0"},
+			{Pod: pod1, NodeID: "node-1"},
+		},
+	}
+
+	down := &downBucketAdmin{}
+	healthy := newFakeBucketAdmin()
+	healthy.buckets[testBucketID] = &garageadmin.GetBucketInfoResponse{Id: testBucketID}
+
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{})
+	bucket.Status = garagev1alpha1.GarageBucketStatus{BucketID: testBucketID}
+
+	scheme := bucketTestScheme(t)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(bucket, cluster, secret).
+		WithStatusSubresource(&garagev1alpha1.GarageBucket{}).
+		Build()
+	r := &GarageBucketReconciler{
+		Client: c,
+		Scheme: scheme,
+		NewAdminClient: func(baseURL, _ string) (bucketAdmin, error) {
+			if strings.Contains(baseURL, pod0+".") {
+				return down, nil
+			}
+			return healthy, nil
+		},
+		Recorder: record.NewFakeRecorder(100),
+	}
+
+	// Pre-fix, Reconcile only ever builds a client for pod-0 and returns its error; tolerate
+	// that here rather than failing the test on the wrong line, and let the Ready-condition
+	// assertion below carry the pass/fail signal.
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: testBucketName, Namespace: testBucketNS},
+	}); err != nil {
+		t.Logf("Reconcile returned an error (expected pre-fix, when pod-0 is the only candidate): %v", err)
+	}
+
+	got := getBucket(t, c)
+	cond := meta.FindStatusCondition(got.Status.Conditions, conditionReady)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("Ready condition = %+v, want True (bucket reconciled via healthy pod-1 after pod-0 failover)", cond)
 	}
 }

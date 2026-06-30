@@ -199,3 +199,10 @@ func TestDeleteBucketSurfacesFailure(t *testing.T) {
 		t.Fatal("DeleteBucket error = nil, want failure on non-200 (e.g. non-empty bucket)")
 	}
 }
+
+func TestDeleteBucketIdempotentOn404(t *testing.T) {
+	fake := &fakeBucketServer{t: t, deleteStatus: http.StatusNotFound}
+	if err := fake.client().DeleteBucket(context.Background(), testBucketID); err != nil {
+		t.Fatalf("DeleteBucket should treat 404 as success, got %v", err)
+	}
+}

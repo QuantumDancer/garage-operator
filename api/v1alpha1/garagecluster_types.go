@@ -508,6 +508,11 @@ type StorageMigrationStatus struct {
 	// message is a human-readable summary of the current step.
 	// +optional
 	Message string `json:"message,omitempty"`
+
+	// drainedAt is when the node was drained from the layout, used to enforce a minimum
+	// settle before its volumes are destroyed.
+	// +optional
+	DrainedAt *metav1.Time `json:"drainedAt,omitempty"`
 }
 
 // GarageClusterStatus defines the observed state of GarageCluster.

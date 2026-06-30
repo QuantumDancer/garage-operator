@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -70,6 +71,14 @@ const workloadRequeue = 10 * time.Second
 // covered by the Owns() watches, so without a steady-state requeue status.health would go
 // stale until an unrelated change happened to trigger a reconcile.
 const steadyStateRequeue = time.Minute
+
+// minResyncSettle is the minimum time the storage migration waits after draining a node before
+// it will consider destroying that node's volumes. Garage's partitionsAllOk is a pure
+// connectivity count (peers up), so it reads full immediately after the drain — long before the
+// block-resync that actually moves the drained data has even been queued. This window bounds the
+// interval in which resync has certainly started, so the subsequent worker-idle check is
+// meaningful and not fooled by a "resync not begun yet" lull where no worker is busy yet.
+const minResyncSettle = 30 * time.Second
 
 // clusterAdmin is the slice of the Garage Admin API the cluster controller needs. It is an
 // interface so reconcile logic can be exercised against a fake in tests.
@@ -219,9 +228,16 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Refresh health before the layout and migration steps: both guardrails refuse to drain a
-	// node while the cluster is unhealthy, and the migration waits on the partition counts.
+	// node while the cluster is unhealthy, and the migration waits on the partition counts. On a
+	// read failure, invalidate the previously-persisted health rather than keep the stale value —
+	// every drain guardrail (destructive layout, migration drain, zone redundancy) gates on a
+	// non-nil, healthy status.Health, so a transient failure must not let a drain proceed on a
+	// stale "healthy" reading.
 	if health, herr := layoutClient.Health(ctx); herr == nil {
 		status.Health = buildHealthStatus(health)
+	} else {
+		log.Info("Could not refresh cluster health; invalidating cached health so drain guardrails fail safe", "reason", herr.Error())
+		status.Health = nil
 	}
 
 	// A storage migration recreates a node's volumes one node at a time and owns the layout for
@@ -231,6 +247,7 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	migrating, err := r.reconcileStorageMigration(ctx, &cluster, status, layoutClient, desired)
 	if err != nil {
 		setCondition(status, conditionReady, metav1.ConditionFalse, "StorageMigrationError", err.Error())
+		_, _ = r.finish(ctx, &cluster, status, ctrl.Result{})
 		return ctrl.Result{}, err
 	}
 	if migrating {
@@ -240,11 +257,13 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if err := r.reconcileLayout(ctx, &cluster, status, layoutClient, desired); err != nil {
 		setCondition(status, conditionReady, metav1.ConditionFalse, "LayoutError", err.Error())
+		_, _ = r.finish(ctx, &cluster, status, ctrl.Result{})
 		return ctrl.Result{}, err
 	}
 
 	if err := r.reconcileZoneRedundancy(ctx, &cluster, status, layoutClient, desired); err != nil {
 		setCondition(status, conditionReady, metav1.ConditionFalse, "ZoneRedundancyError", err.Error())
+		_, _ = r.finish(ctx, &cluster, status, ctrl.Result{})
 		return ctrl.Result{}, err
 	}
 
@@ -382,7 +401,7 @@ func (r *GarageClusterReconciler) ensureStatefulSet(ctx context.Context, cluster
 	if existing.Spec.Replicas != nil && desiredReplicas != nil && *desiredReplicas < *existing.Spec.Replicas {
 		desiredReplicas = existing.Spec.Replicas
 	}
-	if equalInt32Ptr(existing.Spec.Replicas, desiredReplicas) &&
+	if ptr.Equal(existing.Spec.Replicas, desiredReplicas) &&
 		apiequality.Semantic.DeepEqual(existing.Spec.Template, desired.Spec.Template) {
 		return nil
 	}
@@ -421,48 +440,97 @@ type nodeEndpoint struct {
 	nodeID   string
 	zone     string
 	capacity resource.Quantity
+
+	// reachable reports whether the node's Garage admin API answered this pass. An
+	// unreachable node is still kept in the desired set (so layout planning does not mistake a
+	// transient outage for a removal and drain it), but it must not be used as the layout
+	// client and must not be peered to. Only consumers that act on reachability read this; the
+	// distinctZones/migration helpers ignore it.
+	reachable bool
 }
 
 // discoverNodes resolves each pod's Garage node id over headless per-pod DNS and returns the
 // desired layout plus a client to use for layout operations (the layout is cluster-wide, so
-// any reachable node serves). An error means a node is not reachable yet — the caller treats
-// that as "requeue", not a failure.
+// any reachable node serves). An error means the layout cannot be planned this pass (no zone
+// resolvable, no client constructible, or no node reachable at all) — the caller treats that
+// as "requeue", not a failure.
+//
+// A single unreachable node must NOT freeze every other day-2 operation: the cluster keeps
+// serving on quorum, so the operator proceeds on the reachable subset. The catch is that the
+// returned set feeds both peering and layout planning, and dropping an unreachable node from
+// the layout set would make PlanLayout read it as a removal and drain a node that is merely
+// temporarily down. So an unreachable node that is already in the applied layout is retained
+// here from its last-known status (with reachable=false) precisely so it is never treated as
+// a removal; a brand-new node that was never laid out is skipped instead, since excluding a
+// pending addition is safe.
 func (r *GarageClusterReconciler) discoverNodes(ctx context.Context, cluster *garagev1alpha1.GarageCluster, token string) ([]nodeEndpoint, clusterAdmin, error) {
+	log := logf.FromContext(ctx)
 	var nodes []nodeEndpoint
 	var layoutClient clusterAdmin
 
 	for i := range cluster.Spec.NodePools {
 		pool := &cluster.Spec.NodePools[i]
 		for ordinal := int32(0); ordinal < pool.Replicas; ordinal++ {
-			podName := fmt.Sprintf("%s-%d", statefulSetName(cluster, pool), ordinal)
-			zone, err := r.resolveZone(ctx, cluster, pool, podName)
+			pod := podName(statefulSetName(cluster, pool), ordinal)
+			zone, err := r.resolveZone(ctx, cluster, pool, pod)
 			if err != nil {
 				return nil, nil, err
 			}
-			baseURL := fmt.Sprintf("http://%s.%s.%s.svc:%d", podName, headlessServiceName(cluster), cluster.Namespace, portAdmin)
+			baseURL := adminURLForPod(cluster, pod)
 			admin, err := r.NewAdminClient(baseURL, token)
 			if err != nil {
 				return nil, nil, err
 			}
 			nodeID, err := admin.NodeID(ctx)
 			if err != nil {
-				return nil, nil, fmt.Errorf("node %s: %w", podName, err)
+				// The node's admin API is unreachable. resolveZone above reads Kubernetes objects,
+				// not Garage, so the live zone is still trustworthy for a down node.
+				if cached, ok := layoutNodeForPod(cluster, pod); ok {
+					log.Info("Garage node is unreachable; proceeding with its last-known layout entry", "node", pod, "nodeID", cached.NodeID)
+					nodes = append(nodes, nodeEndpoint{
+						pod:       pod,
+						nodeID:    cached.NodeID,
+						zone:      zone,
+						capacity:  pool.Storage.Data.Size,
+						reachable: false,
+					})
+					continue
+				}
+				// Never laid out, so it is a pending addition rather than a removal — excluding it
+				// is safe, and it has no node id to contribute anyway.
+				log.Info("New Garage node is not reachable yet; skipping until it answers", "node", pod)
+				continue
 			}
 			if layoutClient == nil {
 				layoutClient = admin
 			}
 			nodes = append(nodes, nodeEndpoint{
-				pod:      podName,
-				nodeID:   nodeID,
-				zone:     zone,
-				capacity: pool.Storage.Data.Size,
+				pod:       pod,
+				nodeID:    nodeID,
+				zone:      zone,
+				capacity:  pool.Storage.Data.Size,
+				reachable: true,
 			})
 		}
 	}
 	if layoutClient == nil {
-		return nil, nil, fmt.Errorf("no nodes discovered")
+		return nil, nil, fmt.Errorf("no reachable nodes discovered")
 	}
 	return nodes, layoutClient, nil
+}
+
+// layoutNodeForPod returns the applied-layout entry for a pod from the last reconcile's
+// status, used to retain an unreachable-but-already-laid-out node in the desired set.
+func layoutNodeForPod(cluster *garagev1alpha1.GarageCluster, podName string) (garagev1alpha1.LayoutNodeStatus, bool) {
+	if cluster.Status.Layout == nil {
+		return garagev1alpha1.LayoutNodeStatus{}, false
+	}
+	for _, n := range cluster.Status.Layout.Nodes {
+		if n.Pod == podName {
+			return n, true
+		}
+	}
+	return garagev1alpha1.LayoutNodeStatus{}, false
 }
 
 // resolveZone determines the Garage layout zone for a single pod. Precedence (PLAN §4.1):
@@ -523,17 +591,29 @@ func (r *GarageClusterReconciler) finish(ctx context.Context, cluster *garagev1a
 }
 
 // peerConnectStrings builds the Garage connect strings ("<nodeID>@<host>:<rpcPort>") the
-// operator hands to ConnectNodes. The first node backs the layout client and is the one we
-// connect *from*, so it is excluded — connecting it to every other node is enough for gossip
-// to propagate full membership. Returns nil for a single-node cluster (nothing to peer).
+// operator hands to ConnectNodes. The first reachable node backs the layout client and is the
+// one we connect *from*, so it is excluded — connecting it to every other node is enough for
+// gossip to propagate full membership. This shares discoverNodes' invariant that the layout
+// client is the first reachable node, so both functions agree on which node to connect from.
+// Unreachable nodes are skipped entirely: they are retained in the desired set only to keep
+// layout planning from draining them, never to be dialed. Returns nil when there is no second
+// reachable node to peer to.
 func peerConnectStrings(cluster *garagev1alpha1.GarageCluster, nodes []nodeEndpoint) []string {
-	if len(nodes) < 2 {
-		return nil
-	}
-	peers := make([]string, 0, len(nodes)-1)
-	for _, n := range nodes[1:] {
-		host := fmt.Sprintf("%s.%s.%s.svc", n.pod, headlessServiceName(cluster), cluster.Namespace)
+	peers := make([]string, 0, len(nodes))
+	connectFromSeen := false
+	for _, n := range nodes {
+		if !n.reachable {
+			continue
+		}
+		if !connectFromSeen {
+			connectFromSeen = true
+			continue
+		}
+		host := podDNSName(cluster, n.pod)
 		peers = append(peers, fmt.Sprintf("%s@%s:%d", n.nodeID, host, portRPC))
+	}
+	if len(peers) == 0 {
+		return nil
 	}
 	return peers
 }
@@ -586,13 +666,6 @@ func setCondition(status *garagev1alpha1.GarageClusterStatus, condType string, s
 
 func endpointURL(service, namespace string, port int) string {
 	return fmt.Sprintf("http://%s.%s.svc:%d", service, namespace, port)
-}
-
-func equalInt32Ptr(a, b *int32) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
 }
 
 // generateToken returns 32 bytes of cryptographic randomness as a hex string, suitable for

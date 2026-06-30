@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"time"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -35,6 +37,10 @@ import (
 	garagev1alpha1 "github.com/QuantumDancer/garage-operator/api/v1alpha1"
 	"github.com/QuantumDancer/garage-operator/internal/garageadmin"
 )
+
+// noProvisioner is the provisioner the integration specs give their StorageClasses: envtest has
+// no real provisioner, and these specs stand in for the StatefulSet/PVC controllers by hand.
+const noProvisioner = "kubernetes.io/no-provisioner"
 
 // This envtest spec proves the storage-growth path is wired into Reconcile against a real API
 // server: editing a pool's data size grows the existing PVCs and recreates the StatefulSet with
@@ -77,7 +83,7 @@ var _ = Describe("GarageCluster storage growth integration", Ordered, func() {
 
 		Expect(k8sClient.Create(ctx, &storagev1.StorageClass{
 			ObjectMeta:           metav1.ObjectMeta{Name: scName},
-			Provisioner:          "kubernetes.io/no-provisioner",
+			Provisioner:          noProvisioner,
 			AllowVolumeExpansion: ptr.To(true),
 		})).To(Succeed())
 
@@ -331,7 +337,7 @@ var _ = Describe("GarageCluster storage migration integration", Ordered, func() 
 		})).To(Succeed())
 		Expect(k8sClient.Create(ctx, &storagev1.StorageClass{
 			ObjectMeta:           metav1.ObjectMeta{Name: scName},
-			Provisioner:          "kubernetes.io/no-provisioner",
+			Provisioner:          noProvisioner,
 			AllowVolumeExpansion: ptr.To(true),
 		})).To(Succeed())
 
@@ -414,8 +420,14 @@ var _ = Describe("GarageCluster storage migration integration", Ordered, func() 
 		Expect(k8sClient.Get(ctx, clusterKey, &cluster)).To(Succeed())
 		Expect(cluster.Status.StorageMigration.Phase).To(Equal(garagev1alpha1.StorageMigrationAwaitingReplication))
 
-		By("advancing to RecreatingVolume once fully replicated")
+		By("advancing to RecreatingVolume once fully replicated and the resync settle has elapsed")
 		hp.PartitionsAllOk = 256
+		// The destroy gate also requires minResyncSettle to have elapsed since the drain; the rapid
+		// test reconciles never let it pass on their own, so push DrainedAt into the past. This
+		// suite's fake admin has no maint, so ListActiveWorkers returns no resync worker.
+		Expect(k8sClient.Get(ctx, clusterKey, &cluster)).To(Succeed())
+		cluster.Status.StorageMigration.DrainedAt = ptr.To(metav1.NewTime(time.Now().Add(-time.Hour)))
+		Expect(k8sClient.Status().Update(ctx, &cluster)).To(Succeed())
 		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(k8sClient.Get(ctx, clusterKey, &cluster)).To(Succeed())
@@ -467,6 +479,165 @@ var _ = Describe("GarageCluster storage migration integration", Ordered, func() 
 		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(layout.applied).To(HaveKey(node0), "the recreated node rejoins the layout")
+	})
+})
+
+// This envtest spec is the data-safety regression guard for the storage-migration destroy gate
+// (REVIEW.md #4). Garage's partitionsAllOk is a node-connectivity count, not a data-presence one,
+// so it reads full within seconds of a drain while block-resync is still copying data. Destroying
+// the drained node's volume on partitionsAllOk alone loses the not-yet-moved data. The gate must
+// therefore additionally require a settle window since the drain AND no active block-resync
+// worker before it advances past AwaitingReplication. This spec drives a migration to
+// AwaitingReplication with the cluster fully replicated and proves the gate holds the destroy
+// (a) within the settle window, and (b) with a resync worker still active, and only releases it
+// (c) once the settle has elapsed and no resync worker remains.
+var _ = Describe("GarageCluster storage migration destroy-gate regression", Ordered, func() {
+	const (
+		itNamespace = "garage-cluster-gate-it"
+		clusterName = "gatecluster"
+		scName      = "gatable"
+		node0       = "id-gatecluster-default-0"
+		node1       = "id-gatecluster-default-1"
+	)
+
+	layout := newFakeLayout()
+	hp := &garageadmin.GetClusterHealthResponse{
+		Status: healthStatusHealthy, Partitions: 256, PartitionsQuorum: 256, PartitionsAllOk: 256,
+	}
+	maint := &fakeMaintenance{}
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), layout: layout, health: hp, maint: maint}, nil
+			},
+			Recorder: record.NewFakeRecorder(100),
+		}
+	}
+
+	clusterKey := client.ObjectKey{Name: clusterName, Namespace: itNamespace}
+	ssKey := client.ObjectKey{Name: clusterName + "-default", Namespace: itNamespace}
+	data0 := client.ObjectKey{Name: claimName(volumeNameData, ssKey.Name, 0), Namespace: itNamespace}
+
+	markSSReady := func() {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, ssKey, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = *ss.Spec.Replicas
+		ss.Status.ReadyReplicas = *ss.Spec.Replicas
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	provisionClaim := func(volume string, ordinal int32, size string) {
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: claimName(volume, ssKey.Name, ordinal), Namespace: itNamespace},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				StorageClassName: ptr.To(scName),
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+		pvc.Status.Phase = corev1.ClaimBound
+		pvc.Status.Capacity = corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)}
+		Expect(k8sClient.Status().Update(ctx, pvc)).To(Succeed())
+	}
+
+	migrationPhase := func() garagev1alpha1.StorageMigrationPhase {
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, clusterKey, &cluster)).To(Succeed())
+		Expect(cluster.Status.StorageMigration).NotTo(BeNil())
+		return cluster.Status.StorageMigration.Phase
+	}
+
+	// pushDrainedAtToPast satisfies the settle window by backdating the recorded drain time.
+	pushDrainedAtToPast := func() {
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, clusterKey, &cluster)).To(Succeed())
+		cluster.Status.StorageMigration.DrainedAt = ptr.To(metav1.NewTime(time.Now().Add(-time.Hour)))
+		Expect(k8sClient.Status().Update(ctx, &cluster)).To(Succeed())
+	}
+
+	expectData0Intact := func() {
+		var pvc corev1.PersistentVolumeClaim
+		Expect(k8sClient.Get(ctx, data0, &pvc)).To(Succeed())
+		Expect(pvc.DeletionTimestamp).To(BeNil(), "the drained node's volume must not be destroyed while the gate holds")
+	}
+
+	BeforeAll(func() {
+		Expect(k8sClient.Create(ctx, &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: itNamespace},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &storagev1.StorageClass{
+			ObjectMeta:           metav1.ObjectMeta{Name: scName},
+			Provisioner:          noProvisioner,
+			AllowVolumeExpansion: ptr.To(true),
+		})).To(Succeed())
+
+		cluster := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: itNamespace},
+			Spec:       newBasicClusterSpec(2, 2),
+		}
+		cluster.Spec.NodePools[0].Storage.Data = garagev1alpha1.StorageSpec{Size: resource.MustParse("2Gi"), StorageClass: ptr.To(scName)}
+		cluster.Spec.NodePools[0].Storage.Meta = garagev1alpha1.StorageSpec{Size: resource.MustParse("1Gi"), StorageClass: ptr.To(scName)}
+		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+	})
+
+	AfterAll(func() {
+		cluster := &garagev1alpha1.GarageCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: itNamespace}}
+		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, cluster))).To(Succeed())
+	})
+
+	It("drains the first node into AwaitingReplication when the data size is shrunk", func() {
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+		for ordinal := range int32(2) {
+			provisionClaim(volumeNameData, ordinal, "2Gi")
+			provisionClaim(volumeNameMeta, ordinal, "1Gi")
+		}
+		markSSReady()
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applied).To(HaveKey(node0))
+		Expect(layout.applied).To(HaveKey(node1))
+
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, clusterKey, &cluster)).To(Succeed())
+		cluster.Spec.NodePools[0].Storage.Data.Size = resource.MustParse("1Gi")
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(migrationPhase()).To(Equal(garagev1alpha1.StorageMigrationAwaitingReplication))
+		Expect(layout.applied).NotTo(HaveKey(node0), "the drained node must leave the layout")
+	})
+
+	It("holds the destroy within the settle window even when fully replicated", func() {
+		// DrainedAt was stamped ~now by the drain, so minResyncSettle has not elapsed.
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(migrationPhase()).To(Equal(garagev1alpha1.StorageMigrationAwaitingReplication))
+		expectData0Intact()
+	})
+
+	It("holds the destroy past the settle window while a block-resync worker is active", func() {
+		pushDrainedAtToPast()
+		maint.workers = []garageadmin.WorkerSummary{{Name: "block resync worker", State: "busy"}}
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(migrationPhase()).To(Equal(garagev1alpha1.StorageMigrationAwaitingReplication))
+		expectData0Intact()
+	})
+
+	It("advances to RecreatingVolume once the settle has elapsed and no resync worker remains", func() {
+		pushDrainedAtToPast()
+		maint.workers = nil
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: clusterKey})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(migrationPhase()).To(Equal(garagev1alpha1.StorageMigrationRecreatingVolume))
 	})
 })
 

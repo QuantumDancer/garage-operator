@@ -58,6 +58,21 @@ const (
 	storageMigrate
 )
 
+// poolVolume pairs one of a pool's managed volumes with its storage spec.
+type poolVolume struct {
+	name string
+	spec garagev1alpha1.StorageSpec
+}
+
+// poolVolumes returns a pool's managed volumes (data then meta) in the fixed order every storage
+// path iterates them, so the data/meta pair lives in exactly one place.
+func poolVolumes(pool *garagev1alpha1.NodePool) []poolVolume {
+	return []poolVolume{
+		{volumeNameData, pool.Storage.Data},
+		{volumeNameMeta, pool.Storage.Meta},
+	}
+}
+
 // reconcileStorage grows the data/meta volumes of each pool in place when their spec sizes
 // have increased on an expansion-capable StorageClass (Path A, PLAN.md §5.4). Because a
 // StatefulSet's volumeClaimTemplates are immutable, growing a volume is a two-part operation
@@ -144,13 +159,7 @@ func (r *GarageClusterReconciler) reconcileStorage(ctx context.Context, cluster 
 // StorageClass cannot expand). migrate routes the *whole* pool to migration: its volumes are
 // left untouched here so the migration recreates every PVC from the new template uniformly.
 func (r *GarageClusterReconciler) planPoolStorage(ctx context.Context, cluster *garagev1alpha1.GarageCluster, pool *garagev1alpha1.NodePool, ss *appsv1.StatefulSet) (grew bool, migrate bool, err error) {
-	volumes := []struct {
-		name string
-		spec garagev1alpha1.StorageSpec
-	}{
-		{volumeNameData, pool.Storage.Data},
-		{volumeNameMeta, pool.Storage.Meta},
-	}
+	volumes := poolVolumes(pool)
 
 	// Classify every volume before mutating anything, so routing the pool to migration leaves
 	// the other volume unpatched.
@@ -194,6 +203,10 @@ func (r *GarageClusterReconciler) planPoolStorage(ctx context.Context, cluster *
 // grow is served in place only when the backing StorageClass allows expansion; a shrink, or a grow
 // the class cannot expand, goes through the migration path. The bool return is false when
 // classification is not yet possible (the claim is not provisioned), so the caller defers.
+//
+// poolMigrationTarget (garagecluster_storage_migration.go) encodes the same in-place-vs-migration
+// classification against a node's live PVCs rather than the StatefulSet template; keep the two in
+// lockstep when this logic changes.
 func (r *GarageClusterReconciler) classifyVolume(ctx context.Context, namespace string, ss *appsv1.StatefulSet, volume string, spec garagev1alpha1.StorageSpec) (storageAction, bool, error) {
 	drifted, ok, err := r.classMigrationNeeded(ctx, namespace, ss.Name, volume, spec.StorageClass)
 	if err != nil {

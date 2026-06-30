@@ -51,6 +51,14 @@ func (r *GarageClusterReconciler) reconcileLayout(ctx context.Context, cluster *
 	if !plan.IsDestructive() {
 		version := plan.CurrentVersion
 		if plan.HasChanges() {
+			// Clear anything a prior crash may have left staged first, so the apply commits exactly
+			// this plan. PlanLayout diffs only the applied layout, so a change staged-but-never-applied
+			// by a crashed pass (then reverted in spec) is invisible to the diff yet would ride along
+			// in the version+1 union this ApplyLayout commits — applying a change the user never approved.
+			if err := layoutClient.RevertStagedChanges(ctx); err != nil {
+				setCondition(status, conditionLayoutApplied, metav1.ConditionFalse, "LayoutError", err.Error())
+				return err
+			}
 			if err := layoutClient.StageLayoutChanges(ctx, plan.AdditiveChanges); err != nil {
 				setCondition(status, conditionLayoutApplied, metav1.ConditionFalse, "LayoutError", err.Error())
 				return err
@@ -64,6 +72,15 @@ func (r *GarageClusterReconciler) reconcileLayout(ctx context.Context, cluster *
 		setCondition(status, conditionLayoutApplied, metav1.ConditionTrue, "LayoutApplied", fmt.Sprintf("Cluster layout version %d applied", version))
 		meta.RemoveStatusCondition(&status.Conditions, conditionLayoutChangePending)
 		status.Layout = buildLayoutStatus(desired, version)
+		// Tear down any workload that is surplus to spec but already out of the layout. This branch
+		// is reached only when the plan is non-destructive, i.e. no applied-layout node is outside
+		// the desired set — so every spec-surplus node (a shrunk pool's high ordinals, a removed
+		// pool's nodes) has already been drained and is safe to remove. Running it here on every
+		// pass turns the one-time tail-of-apply teardown into an idempotent invariant that also
+		// retries a teardown a prior approved pass left half-finished (REVIEW.md #6).
+		if err := r.reconcileRemovedWorkload(ctx, cluster); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -100,6 +117,21 @@ func distinctZones(desired []nodeEndpoint) int {
 // pass. The cluster keeps serving throughout, so Ready is left to the caller. status.Health
 // must already be set.
 func (r *GarageClusterReconciler) reconcileZoneRedundancy(ctx context.Context, cluster *garagev1alpha1.GarageCluster, status *garagev1alpha1.GarageClusterStatus, layoutClient clusterAdmin, desired []nodeEndpoint) error {
+	// Defer the ungated zone-redundancy change while a destructive layout change is awaiting
+	// approval. Applying a zone change bumps the layout version (SetZoneRedundancy), but the
+	// approval annotation is keyed to the pending change's target version; bumping the version
+	// here would move that target out from under the approval the user is about to give, silently
+	// dropping it until they re-approve (REVIEW.md #11). LayoutChangePending=True means uniquely
+	// "destructive change pending approval" — reconcileLayout's pending branch is the only writer
+	// that sets it True (the approved/additive branches remove it, blockLayoutChange sets it
+	// False), so a permanently blocked change does NOT freeze zone redundancy. Once the drain is
+	// approved+applied or the destructive edit reverted, the condition clears and the next
+	// steady-state requeue applies the zone change.
+	if meta.IsStatusConditionPresentAndEqual(status.Conditions, conditionLayoutChangePending, metav1.ConditionTrue) {
+		logf.FromContext(ctx).Info("Deferring zone-redundancy change while a destructive layout change awaits approval")
+		return nil
+	}
+
 	want := desiredZoneRedundancy(cluster)
 	current, err := layoutClient.CurrentZoneRedundancy(ctx)
 	if err != nil {
@@ -113,7 +145,9 @@ func (r *GarageClusterReconciler) reconcileZoneRedundancy(ctx context.Context, c
 		// Guardrail: mode AtLeast requires a positive atLeast. The kubebuilder Minimum=1 marker is
 		// only enforced when the field is present, so `{mode: AtLeast}` with atLeast omitted slips
 		// through admission as 0. Refuse it here rather than ship a nonsensical atLeast:0 to Garage
-		// (a validating webhook will reject it at admission in Phase 6).
+		// (the CEL XValidation marker on ZoneRedundancy, api/v1alpha1/garagecluster_types.go, already
+		// rejects this at admission; this check is defense-in-depth for CRs that predate the marker
+		// or if admission validation is ever bypassed).
 		if want.AtLeast < 1 {
 			msg := "Invalid zone redundancy: mode AtLeast requires atLeast >= 1"
 			setCondition(status, conditionLayoutApplied, metav1.ConditionFalse, "ZoneRedundancyInvalid", msg)
@@ -235,6 +269,13 @@ func (r *GarageClusterReconciler) blockLayoutChange(ctx context.Context, cluster
 // the StatefulSets of pools removed from spec entirely, deleting the orphaned PVCs in both
 // cases. It is idempotent — a pool already at its desired size is left untouched — so it is
 // safe to re-run after a crash between ApplyLayout and teardown.
+//
+// It runs both right after an approved destructive ApplyLayout (prompt teardown in the same
+// pass) and at the end of the additive branch (every-pass retry/invariant). The additive call
+// is safe because that branch is reached only when the applied layout already excludes every
+// spec-surplus node — so this is keyed on spec but never tears down a node whose drain has not
+// yet been applied; while a drain is still pending or unapproved the destructive branch runs
+// instead and this is not called.
 func (r *GarageClusterReconciler) reconcileRemovedWorkload(ctx context.Context, cluster *garagev1alpha1.GarageCluster) error {
 	desiredReplicas := make(map[string]int32, len(cluster.Spec.NodePools))
 	for i := range cluster.Spec.NodePools {
