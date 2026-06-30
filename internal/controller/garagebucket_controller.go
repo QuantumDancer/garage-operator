@@ -262,9 +262,10 @@ func (r *GarageBucketReconciler) ensureBucket(
 	return info, nil
 }
 
-// reconcileDelete honours deletionPolicy when the CR is being deleted. A Retain policy (or a
-// bucket that was never created) just drops the finalizer. A Delete policy removes the Garage
-// bucket first, refusing while it is non-empty so data is never silently discarded.
+// reconcileDelete honours deletionPolicy when the CR is being deleted. A Retain policy (or an
+// unfindable bucket — see findBucketForDeletion) just drops the finalizer. A Delete policy
+// removes the Garage bucket first, refusing while it is non-empty so data is never silently
+// discarded.
 func (r *GarageBucketReconciler) reconcileDelete(ctx context.Context, bucket *garagev1alpha1.GarageBucket) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -272,7 +273,15 @@ func (r *GarageBucketReconciler) reconcileDelete(ctx context.Context, bucket *ga
 		return ctrl.Result{}, nil
 	}
 
-	if bucket.Spec.DeletionPolicy != garagev1alpha1.BucketDeletionDelete || bucket.Status.BucketID == "" {
+	// A non-Delete policy (Retain) leaves the Garage bucket in place.
+	if bucket.Spec.DeletionPolicy != garagev1alpha1.BucketDeletionDelete {
+		return r.removeFinalizer(ctx, bucket)
+	}
+	// With neither a recorded id nor a global alias, the bucket is unfindable: either it was
+	// never created, or it is an aliasless bucket whose id was lost to an external status reset.
+	// The latter is unrecoverable — an aliasless bucket has no handle to look it up by — so there
+	// is nothing we can delete; drop the finalizer.
+	if bucket.Status.BucketID == "" && len(bucket.Spec.GlobalAliases) == 0 {
 		return r.removeFinalizer(ctx, bucket)
 	}
 
@@ -296,7 +305,7 @@ func (r *GarageBucketReconciler) reconcileDelete(ctx context.Context, bucket *ga
 		return ctrl.Result{RequeueAfter: clusterPendingRequeue}, nil
 	}
 
-	info, found, err := admin.GetBucketByID(ctx, bucket.Status.BucketID)
+	info, found, err := r.findBucketForDeletion(ctx, admin, bucket)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -304,11 +313,38 @@ func (r *GarageBucketReconciler) reconcileDelete(ctx context.Context, bucket *ga
 		if info.Objects > 0 {
 			return r.blockDeletion(ctx, bucket, info.Objects)
 		}
-		if err := admin.DeleteBucket(ctx, bucket.Status.BucketID); err != nil {
+		if err := admin.DeleteBucket(ctx, info.Id); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 	return r.removeFinalizer(ctx, bucket)
+}
+
+// findBucketForDeletion locates the Garage bucket a CR owns, for deletion. It prefers the id
+// recorded in status; only when no id is recorded does it fall back to a global-alias lookup.
+// The fallback matters when the id was lost (a create whose status write never landed, or a
+// status reset) — without it an aliased bucket would be orphaned, its finalizer dropped while
+// the Garage bucket and its data persist. The fallback is deliberately gated on an EMPTY id: a
+// recorded-but-not-found id means the bucket we owned is already gone, and a global alias freed
+// by that deletion may since have been reused by a different bucket we must not delete.
+func (r *GarageBucketReconciler) findBucketForDeletion(
+	ctx context.Context,
+	admin bucketAdmin,
+	bucket *garagev1alpha1.GarageBucket,
+) (*garageadmin.GetBucketInfoResponse, bool, error) {
+	if bucket.Status.BucketID != "" {
+		return admin.GetBucketByID(ctx, bucket.Status.BucketID)
+	}
+	for _, alias := range bucket.Spec.GlobalAliases {
+		info, found, err := admin.GetBucketByGlobalAlias(ctx, alias)
+		if err != nil {
+			return nil, false, err
+		}
+		if found {
+			return info, true, nil
+		}
+	}
+	return nil, false, nil
 }
 
 // blockDeletion refuses to delete a non-empty bucket, surfacing why on the CR and requeueing

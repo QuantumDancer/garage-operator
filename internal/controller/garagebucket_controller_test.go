@@ -654,6 +654,70 @@ func TestBucketDeleteRefusesNonEmptyBucket(t *testing.T) {
 	}
 }
 
+// TestBucketDeleteByAliasWhenBucketIDLost is the regression test for REVIEW.md #13:
+// status.BucketID can go missing without the Garage bucket itself ever having been removed (a
+// create whose status write never landed, or an external status reset). Before the fix,
+// reconcileDelete treated an empty id under DeletionPolicy: Delete as "nothing to delete" and
+// dropped the finalizer outright, orphaning the bucket and its data. With a global alias still on
+// the spec, the bucket is findable by that alias and must be deleted through it instead.
+func TestBucketDeleteByAliasWhenBucketIDLost(t *testing.T) {
+	cluster, secret := readyCluster()
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{
+		DeletionPolicy: garagev1alpha1.BucketDeletionDelete,
+		GlobalAliases:  []string{testBucketName},
+	})
+	// bucket.Status.BucketID is left at its zero value: the lost-id case under test.
+	admin := newFakeBucketAdmin()
+	admin.buckets[testBucketID] = &garageadmin.GetBucketInfoResponse{Id: testBucketID, Objects: 0}
+	admin.aliases[testBucketName] = testBucketID
+	r, c := newBucketReconciler(t, admin, bucket, cluster, secret)
+
+	if err := c.Delete(context.Background(), bucket); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	got := getBucket(t, c)
+
+	if _, err := r.reconcileDelete(context.Background(), got); err != nil {
+		t.Fatalf("reconcileDelete: %v", err)
+	}
+
+	if admin.deleteCalls != 1 {
+		t.Errorf("deleteCalls = %d, want 1 (bucket resolved via its global alias)", admin.deleteCalls)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: testBucketName, Namespace: testBucketNS}, &garagev1alpha1.GarageBucket{}); !apierrors.IsNotFound(err) {
+		t.Errorf("bucket still present after deletion: err=%v", err)
+	}
+}
+
+// TestBucketDeleteUnfindableDropsFinalizer documents the boundary TestBucketDeleteByAliasWhenBucketIDLost
+// relies on: with no recorded id AND no global alias, the bucket has no handle to look it up by
+// (an aliasless bucket whose id was lost is unrecoverable), so reconcileDelete must still drop the
+// finalizer without calling DeleteBucket. This passes both before and after the fix; it pins down
+// the case the fallback is deliberately NOT meant to cover.
+func TestBucketDeleteUnfindableDropsFinalizer(t *testing.T) {
+	cluster, secret := readyCluster()
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{DeletionPolicy: garagev1alpha1.BucketDeletionDelete})
+	// bucket.Status.BucketID is left at its zero value and spec.GlobalAliases is empty: unfindable.
+	admin := newFakeBucketAdmin()
+	r, c := newBucketReconciler(t, admin, bucket, cluster, secret)
+
+	if err := c.Delete(context.Background(), bucket); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	got := getBucket(t, c)
+
+	if _, err := r.reconcileDelete(context.Background(), got); err != nil {
+		t.Fatalf("reconcileDelete: %v", err)
+	}
+
+	if admin.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0 (bucket is unfindable)", admin.deleteCalls)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: testBucketName, Namespace: testBucketNS}, &garagev1alpha1.GarageBucket{}); !apierrors.IsNotFound(err) {
+		t.Errorf("bucket still present after finalizer drop: err=%v", err)
+	}
+}
+
 // downBucketAdmin simulates a node that has stopped answering: NodeID and the bucket lookup
 // both fail, so a controller that targets it cannot converge. Embedding a nil bucketAdmin makes
 // any other method call panic loudly, since converge should never get far enough to attempt one.
