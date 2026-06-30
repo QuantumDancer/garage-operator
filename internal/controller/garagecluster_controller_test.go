@@ -135,6 +135,10 @@ type fakeClusterAdmin struct {
 	// planErr, when set, makes PlanLayout fail so a test can drive the reconcileLayout error
 	// path (the first Admin call reconcileLayout makes).
 	planErr error
+
+	// healthErr, when set, makes Health fail so a test can drive the swallowed-health-error
+	// path: the cached status.Health must be invalidated rather than left stale.
+	healthErr error
 }
 
 func (f *fakeClusterAdmin) CreateMetadataSnapshot(context.Context, string) (garageadmin.MultiNodeResult, error) {
@@ -257,6 +261,9 @@ func newBasicClusterSpec(replicationFactor, replicas int32) garagev1alpha1.Garag
 }
 
 func (f *fakeClusterAdmin) Health(context.Context) (*garageadmin.GetClusterHealthResponse, error) {
+	if f.healthErr != nil {
+		return nil, f.healthErr
+	}
 	if f.health != nil {
 		return f.health, nil
 	}
@@ -667,6 +674,40 @@ var _ = Describe("GarageCluster destructive layout (scale-down)", Ordered, func(
 
 		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
 		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionLayoutChangePending)).To(BeTrue())
+	})
+
+	It("refuses an approved drain when cluster health cannot be confirmed", func() {
+		// Regression guard for REVIEW.md #1: a transient Health() error must invalidate the
+		// cached status.Health rather than leave the stale "healthy" value in place, otherwise
+		// the destructive-drain guardrail acts on stale data and drains a node from a cluster
+		// that may have degraded. The approval is already in place, so only the health guardrail
+		// can hold the drain back.
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Annotations = map[string]string{annotationApproveLayout: "2"}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		unhealthy := &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), recorder: mesh, layout: layout, healthErr: fmt.Errorf("health endpoint timeout")}, nil
+			},
+		}
+
+		_, err := unhealthy.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("not applying the drain")
+		Expect(layout.applyCalls).To(Equal(1))
+
+		By("invalidating the cached health and blocking the change")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(cluster.Status.Health).To(BeNil())
+		blocked := meta.FindStatusCondition(cluster.Status.Conditions, conditionLayoutChangePending)
+		Expect(blocked).NotTo(BeNil())
+		Expect(blocked.Status).To(Equal(metav1.ConditionFalse))
+		Expect(blocked.Reason).To(Equal(reasonBlocked))
 	})
 
 	It("drains the node and reclaims its PVCs once approved", func() {

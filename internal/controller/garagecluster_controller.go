@@ -219,9 +219,16 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Refresh health before the layout and migration steps: both guardrails refuse to drain a
-	// node while the cluster is unhealthy, and the migration waits on the partition counts.
+	// node while the cluster is unhealthy, and the migration waits on the partition counts. On a
+	// read failure, invalidate the previously-persisted health rather than keep the stale value —
+	// every drain guardrail (destructive layout, migration drain, zone redundancy) gates on a
+	// non-nil, healthy status.Health, so a transient failure must not let a drain proceed on a
+	// stale "healthy" reading.
 	if health, herr := layoutClient.Health(ctx); herr == nil {
 		status.Health = buildHealthStatus(health)
+	} else {
+		log.Info("Could not refresh cluster health; invalidating cached health so drain guardrails fail safe", "reason", herr.Error())
+		status.Health = nil
 	}
 
 	// A storage migration recreates a node's volumes one node at a time and owns the layout for
