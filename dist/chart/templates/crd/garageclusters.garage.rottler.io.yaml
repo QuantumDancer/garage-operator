@@ -1683,6 +1683,12 @@ spec:
                   storageMigration reports an in-progress storage migration. Present only while a
                   volume change that cannot be served in place is being rolled through the pool.
                 properties:
+                  drainedAt:
+                    description: |-
+                      drainedAt is when the node was drained from the layout, used to enforce a minimum
+                      settle before its volumes are destroyed.
+                    format: date-time
+                    type: string
                   message:
                     description: message is a human-readable summary of the current
                       step.

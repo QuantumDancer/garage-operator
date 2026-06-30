@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -27,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -189,14 +192,29 @@ func (r *GarageClusterReconciler) migrationDrain(ctx context.Context, cluster *g
 	meta.RemoveStatusCondition(&status.Conditions, conditionStorageChangePending)
 	r.setMigrationStatus(status, step, garagev1alpha1.StorageMigrationAwaitingReplication,
 		fmt.Sprintf("Draining node %d; waiting for the cluster to re-replicate", step.ordinal))
+	// Stamp the drain time on first entry to AwaitingReplication so the destroy gate can enforce
+	// minResyncSettle. Stamping here covers both the just-drained and the already-drained
+	// idempotent re-entry paths; the first stamp is the conservative one (it never moves later).
+	if status.StorageMigration.DrainedAt == nil {
+		status.StorageMigration.DrainedAt = ptr.To(metav1.Now())
+	}
 	return true, nil
 }
 
-// migrationAwaitReplication holds until the drained data has been fully re-replicated onto the
-// remaining nodes before the node's volume is destroyed. Quorum (partitionsQuorum) is not
-// enough — that only means writes are accepted; partitionsAllOk reaching the partition total
-// means every partition is back on all its responsible nodes, so deleting this node's volume
-// loses nothing.
+// migrationAwaitReplication holds until the drained data has actually moved onto the remaining
+// nodes before this node's volume is destroyed. partitionsAllOk is NOT sufficient: Garage
+// computes it as a pure node-connectivity count (write_sets.all(node_up) in src/rpc/system.rs,
+// where node_up is just peer is_up), and once RemoveNode applies the new layout the responsible
+// nodes are the already-up survivors — so partitionsAllOk reads full within ~10s of the drain
+// while block-resync is still copying data in the background. Destroying the volume then would
+// lose the not-yet-moved data. So the destroy is gated on three conditions together:
+//  1. fullyReplicated(health) — necessary connectivity precondition,
+//  2. minResyncSettle has elapsed since the drain — so block-resync has certainly been queued
+//     (closes the race where resync has not started yet, so no worker is busy yet), and
+//  3. no block-resync worker is active on any node — the real "data has moved" signal.
+//
+// All three fail closed: a Health or ListActiveWorkers error returns an error so the reconcile
+// requeues rather than advancing to the destructive RecreatingVolume phase.
 func (r *GarageClusterReconciler) migrationAwaitReplication(ctx context.Context, status *garagev1alpha1.GarageClusterStatus, layoutClient clusterAdmin, step *migrationStep) (bool, error) {
 	health, err := layoutClient.Health(ctx)
 	if err != nil {
@@ -207,9 +225,41 @@ func (r *GarageClusterReconciler) migrationAwaitReplication(ctx context.Context,
 			fmt.Sprintf("Waiting for re-replication after draining node %d (partitions all-ok %d/%d)", step.ordinal, health.PartitionsAllOk, health.Partitions))
 		return true, nil
 	}
+
+	if at := status.StorageMigration.DrainedAt; at != nil && time.Since(at.Time) < minResyncSettle {
+		r.setMigrationStatus(status, step, garagev1alpha1.StorageMigrationAwaitingReplication,
+			fmt.Sprintf("Settling after draining node %d before destroying its volumes", step.ordinal))
+		return true, nil
+	}
+
+	workers, err := layoutClient.ListActiveWorkers(ctx, maintenanceNode)
+	if err != nil {
+		return false, err
+	}
+	if resyncActive(workers) {
+		r.setMigrationStatus(status, step, garagev1alpha1.StorageMigrationAwaitingReplication,
+			fmt.Sprintf("Waiting for block resync to drain before destroying node %d volumes (%d worker(s) active)", step.ordinal, len(workers)))
+		return true, nil
+	}
+
 	r.setMigrationStatus(status, step, garagev1alpha1.StorageMigrationRecreatingVolume,
 		fmt.Sprintf("Recreating volumes for node %d", step.ordinal))
 	return true, nil
+}
+
+// resyncActive reports whether any active worker is a block-resync worker — Garage's
+// data-movement worker, named e.g. "block resync worker". ListActiveWorkers already filters to
+// busy/throttled workers, so a returned resync worker means data is still being copied and the
+// drained node's volume must not be destroyed yet. We match by name and scope strictly to resync:
+// other active workers (scrub, compaction) do not move drained data, so conflating them would
+// wrongly stall the migration.
+func resyncActive(workers []garageadmin.WorkerSummary) bool {
+	for _, w := range workers {
+		if strings.Contains(strings.ToLower(w.Name), "resync") {
+			return true
+		}
+	}
+	return false
 }
 
 // migrationRecreateVolume recreates the node's volumes at the new spec. It first makes the
@@ -324,13 +374,22 @@ func (r *GarageClusterReconciler) blockMigration(cluster *garagev1alpha1.GarageC
 	return true
 }
 
-// setMigrationStatus stamps the current node/phase/message onto status.
+// setMigrationStatus stamps the current node/phase/message onto status. It rebuilds the whole
+// block each pass, so DrainedAt — stamped once at the drain and read by the destroy gate — is
+// carried over from the prior status when that status is for the same node (same pool and
+// ordinal); otherwise it would be dropped on every reconcile and the settle window could never
+// elapse.
 func (r *GarageClusterReconciler) setMigrationStatus(status *garagev1alpha1.GarageClusterStatus, step *migrationStep, phase garagev1alpha1.StorageMigrationPhase, message string) {
+	var drainedAt *metav1.Time
+	if prev := status.StorageMigration; prev != nil && prev.Pool == step.pool.Name && prev.Ordinal == step.ordinal {
+		drainedAt = prev.DrainedAt
+	}
 	status.StorageMigration = &garagev1alpha1.StorageMigrationStatus{
-		Pool:    step.pool.Name,
-		Ordinal: step.ordinal,
-		Phase:   phase,
-		Message: message,
+		Pool:      step.pool.Name,
+		Ordinal:   step.ordinal,
+		Phase:     phase,
+		Message:   message,
+		DrainedAt: drainedAt,
 	}
 }
 

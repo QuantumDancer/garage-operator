@@ -71,6 +71,14 @@ const workloadRequeue = 10 * time.Second
 // stale until an unrelated change happened to trigger a reconcile.
 const steadyStateRequeue = time.Minute
 
+// minResyncSettle is the minimum time the storage migration waits after draining a node before
+// it will consider destroying that node's volumes. Garage's partitionsAllOk is a pure
+// connectivity count (peers up), so it reads full immediately after the drain — long before the
+// block-resync that actually moves the drained data has even been queued. This window bounds the
+// interval in which resync has certainly started, so the subsequent worker-idle check is
+// meaningful and not fooled by a "resync not begun yet" lull where no worker is busy yet.
+const minResyncSettle = 30 * time.Second
+
 // clusterAdmin is the slice of the Garage Admin API the cluster controller needs. It is an
 // interface so reconcile logic can be exercised against a fake in tests.
 type clusterAdmin interface {
