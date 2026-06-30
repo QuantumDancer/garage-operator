@@ -234,28 +234,6 @@ func (c *AdminClient) RevertStagedChanges(ctx context.Context) error {
 	return nil
 }
 
-// EnsureLayout converges the cluster layout so every node in desired holds its target role.
-// It is additive-only: roles are assigned or updated, never removed, so a node missing from
-// desired keeps whatever role it has (destructive removals are planned and gated by the
-// caller via PlanLayout). The call is idempotent — when the applied layout already matches,
-// nothing is staged and applied stays false. It returns the layout version in effect after.
-func (c *AdminClient) EnsureLayout(ctx context.Context, desired []DesiredRole) (applied bool, version int64, err error) {
-	plan, err := c.PlanLayout(ctx, desired)
-	if err != nil {
-		return false, 0, err
-	}
-	if len(plan.AdditiveChanges) == 0 {
-		return false, plan.CurrentVersion, nil
-	}
-	if err = c.StageLayoutChanges(ctx, plan.AdditiveChanges); err != nil {
-		return false, plan.CurrentVersion, err
-	}
-	if err = c.ApplyLayout(ctx, plan.TargetVersion); err != nil {
-		return false, plan.CurrentVersion, err
-	}
-	return true, plan.TargetVersion, nil
-}
-
 // ZoneRedundancyValue is the operator-facing form of a layout's zone-redundancy parameter,
 // flattening Garage's union (the string "maximum" or an {atLeast: N} object) into one struct.
 // Maximum and AtLeast are mutually exclusive: Maximum true means "as many zones as possible";

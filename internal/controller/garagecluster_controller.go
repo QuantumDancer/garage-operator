@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -400,7 +401,7 @@ func (r *GarageClusterReconciler) ensureStatefulSet(ctx context.Context, cluster
 	if existing.Spec.Replicas != nil && desiredReplicas != nil && *desiredReplicas < *existing.Spec.Replicas {
 		desiredReplicas = existing.Spec.Replicas
 	}
-	if equalInt32Ptr(existing.Spec.Replicas, desiredReplicas) &&
+	if ptr.Equal(existing.Spec.Replicas, desiredReplicas) &&
 		apiequality.Semantic.DeepEqual(existing.Spec.Template, desired.Spec.Template) {
 		return nil
 	}
@@ -665,13 +666,6 @@ func setCondition(status *garagev1alpha1.GarageClusterStatus, condType string, s
 
 func endpointURL(service, namespace string, port int) string {
 	return fmt.Sprintf("http://%s.%s.svc:%d", service, namespace, port)
-}
-
-func equalInt32Ptr(a, b *int32) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
 }
 
 // generateToken returns 32 bytes of cryptographic randomness as a hex string, suitable for
