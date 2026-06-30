@@ -64,6 +64,15 @@ func (r *GarageClusterReconciler) reconcileLayout(ctx context.Context, cluster *
 		setCondition(status, conditionLayoutApplied, metav1.ConditionTrue, "LayoutApplied", fmt.Sprintf("Cluster layout version %d applied", version))
 		meta.RemoveStatusCondition(&status.Conditions, conditionLayoutChangePending)
 		status.Layout = buildLayoutStatus(desired, version)
+		// Tear down any workload that is surplus to spec but already out of the layout. This branch
+		// is reached only when the plan is non-destructive, i.e. no applied-layout node is outside
+		// the desired set — so every spec-surplus node (a shrunk pool's high ordinals, a removed
+		// pool's nodes) has already been drained and is safe to remove. Running it here on every
+		// pass turns the one-time tail-of-apply teardown into an idempotent invariant that also
+		// retries a teardown a prior approved pass left half-finished (REVIEW.md #6).
+		if err := r.reconcileRemovedWorkload(ctx, cluster); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -235,6 +244,13 @@ func (r *GarageClusterReconciler) blockLayoutChange(ctx context.Context, cluster
 // the StatefulSets of pools removed from spec entirely, deleting the orphaned PVCs in both
 // cases. It is idempotent — a pool already at its desired size is left untouched — so it is
 // safe to re-run after a crash between ApplyLayout and teardown.
+//
+// It runs both right after an approved destructive ApplyLayout (prompt teardown in the same
+// pass) and at the end of the additive branch (every-pass retry/invariant). The additive call
+// is safe because that branch is reached only when the applied layout already excludes every
+// spec-surplus node — so this is keyed on spec but never tears down a node whose drain has not
+// yet been applied; while a drain is still pending or unapproved the destructive branch runs
+// instead and this is not called.
 func (r *GarageClusterReconciler) reconcileRemovedWorkload(ctx context.Context, cluster *garagev1alpha1.GarageCluster) error {
 	desiredReplicas := make(map[string]int32, len(cluster.Spec.NodePools))
 	for i := range cluster.Spec.NodePools {

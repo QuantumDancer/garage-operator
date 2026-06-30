@@ -562,6 +562,8 @@ var _ = Describe("GarageCluster multi-node mesh", Ordered, func() {
 // createPVC simulates a volumeClaimTemplates PVC that a real StatefulSet controller would
 // create. envtest runs no such controller, so the drain tests stand them up explicitly to
 // assert the operator reclaims the right ones.
+//
+//nolint:unparam // namespace is a parameter for symmetry with pvcExists; tests use "default".
 func createPVC(ctx context.Context, namespace, name string) {
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
@@ -662,6 +664,11 @@ var _ = Describe("GarageCluster destructive layout (scale-down)", Ordered, func(
 		var ss appsv1.StatefulSet
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
 		Expect(*ss.Spec.Replicas).To(Equal(int32(3)))
+
+		By("not reclaiming the surplus node's PVCs while the drain is still in the layout (REVIEW.md #6 safety)")
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-2", vol, ssName))).To(BeTrue())
+		}
 
 		By("reporting LayoutChangePending and not applying the drain")
 		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
@@ -1031,5 +1038,112 @@ var _ = Describe("GarageCluster destructive layout (whole-pool removal)", Ordere
 		By("reporting a single-node layout")
 		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
 		Expect(cluster.Status.Layout.Nodes).To(HaveLen(1))
+	})
+})
+
+var _ = Describe("GarageCluster surplus-workload teardown retried in the additive branch", Ordered, func() {
+	// Regression guard for REVIEW.md #6: drained-workload teardown (scaling a shrunk pool down and
+	// reclaiming its orphaned PVCs) used to run ONLY right after an approved destructive
+	// ApplyLayout. If that teardown failed partway, the next PlanLayout was non-destructive, so
+	// reconcileLayout took the additive branch forever and never re-entered teardown — the surplus
+	// pods/PVCs leaked permanently. The fix also runs reconcileRemovedWorkload at the end of the
+	// additive branch, where it is safe (the applied layout already excludes every spec-surplus
+	// node) and idempotent, so a half-finished teardown is retried on an ordinary later pass.
+	const (
+		resourceName      = "leak"
+		resourceNamespace = "default"
+		ssName            = "leak-default"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	mesh := &meshRecorder{}
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), recorder: mesh, layout: layout}, nil
+			},
+		}
+	}
+
+	markReady := func(replicas int32) {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = replicas
+		ss.Status.ReadyReplicas = replicas
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(3, 3),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+		By("converging the 3-node cluster to Ready")
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		markReady(3)
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+		Expect(layout.applied).To(HaveLen(3))
+
+		By("standing up the PVCs the StatefulSet controller would have created")
+		for ord := range 3 {
+			for _, vol := range []string{volumeNameMeta, volumeNameData} {
+				createPVC(ctx, resourceNamespace, fmt.Sprintf("%s-%s-%d", vol, ssName, ord))
+			}
+		}
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("scales a leaked surplus pool down and reclaims its PVCs on an ordinary non-destructive pass", func() {
+		By("simulating a half-finished teardown: spec is shrunk and node-2 is already out of the layout, while the StatefulSet still runs 3 replicas and node-2's PVCs linger")
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Spec.NodePools[0].Replicas = 2
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+		// ensureStatefulSet refuses to scale a live StatefulSet down, so it stays at 3 replicas and
+		// still reads as ready; dropping node-2 from the applied layout models the drain that a
+		// prior approved pass committed before its workload teardown failed and left the surplus.
+		delete(layout.applied, "id-"+ssName+"-2")
+		Expect(layout.applied).To(HaveLen(2))
+
+		By("reconciling: PlanLayout sees applied == desired, so this is the non-destructive additive branch")
+		applyCallsBefore := layout.applyCalls
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("not staging or applying any layout change (the teardown is workload-only)")
+		Expect(layout.applyCalls).To(Equal(applyCallsBefore))
+
+		By("scaling the StatefulSet down to the desired replica count in the additive branch")
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		Expect(*ss.Spec.Replicas).To(Equal(int32(2)))
+
+		By("reclaiming the leaked node's PVCs while keeping the survivors'")
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-2", vol, ssName))).To(BeFalse())
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-0", vol, ssName))).To(BeTrue())
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-1", vol, ssName))).To(BeTrue())
+		}
+
+		By("reporting the converged 2-node layout and staying Ready")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(2))
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady)).To(BeTrue())
 	})
 })
