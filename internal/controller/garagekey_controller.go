@@ -193,10 +193,11 @@ func (r *GarageKeyReconciler) converge(
 }
 
 // ensureKey resolves the CR to a live Garage key, creating or importing it if necessary, and
-// returns its info. Lookup order: the id already recorded in status, then an already-published
-// output Secret (status lost but credentials persisted — adopt by the unique access key id),
-// then import or create. On create/import the freshly returned secret key is published to the
-// output Secret immediately, because Garage only reveals it once.
+// returns its info. Lookup order: the id already recorded in status (repairing the output Secret
+// if it has since gone missing), then an already-published output Secret (status lost but
+// credentials persisted — adopt by the unique access key id), then import or create. On
+// create/import the freshly returned secret key is published to the output Secret immediately,
+// because Garage only reveals it once.
 func (r *GarageKeyReconciler) ensureKey(
 	ctx context.Context,
 	admin keyAdmin,
@@ -207,6 +208,13 @@ func (r *GarageKeyReconciler) ensureKey(
 		if info, found, err := admin.GetKeyByID(ctx, status.KeyID); err != nil {
 			return nil, err
 		} else if found {
+			// The Garage key exists, but the output Secret may have been deleted out-of-band
+			// (GitOps prune, manual delete). Re-publish it (import keys) or flip the condition
+			// (created keys, whose secret access key Garage reveals only once) so we never keep
+			// reporting CredentialsPublished=True while the Secret workloads mount is gone.
+			if err := r.ensureCredentialsPublished(ctx, key, status, info); err != nil {
+				return nil, err
+			}
 			return info, nil
 		}
 		// The recorded key is gone (deleted out-of-band); fall through and recreate.
@@ -233,6 +241,47 @@ func (r *GarageKeyReconciler) ensureKey(
 	}
 	r.markPublished(status, secretName, info.AccessKeyId)
 	return info, nil
+}
+
+// ensureCredentialsPublished re-publishes the output credentials Secret if it has gone missing
+// for a key that already exists in Garage. An import key can be rebuilt from spec.Import (its
+// secret access key is recoverable from the import Secret); a created key's secret access key is
+// unrecoverable — Garage reveals it only once at creation — so the CredentialsPublished condition
+// is flipped to False to surface the broken state instead of silently claiming success.
+func (r *GarageKeyReconciler) ensureCredentialsPublished(
+	ctx context.Context,
+	key *garagev1alpha1.GarageKey,
+	status *garagev1alpha1.GarageKeyStatus,
+	info *garageadmin.GetKeyInfoResponse,
+) error {
+	secretName := outputSecretName(key)
+	if _, ok, err := r.readSecret(ctx, key.Namespace, secretName, credAccessKeyID, credSecretAccessKey); err != nil {
+		return err
+	} else if ok {
+		return nil // Secret present and complete; nothing to do.
+	}
+
+	if key.Spec.Import != nil {
+		creds, ok, err := r.readSecret(ctx, key.Namespace, key.Spec.Import.SecretName,
+			importAccessKeyIDKey(key.Spec.Import), importSecretAccessKeyKey(key.Spec.Import))
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("import Secret %q is missing or incomplete", key.Spec.Import.SecretName)
+		}
+		if err := r.publishCredentials(ctx, key, info.AccessKeyId, creds[importSecretAccessKeyKey(key.Spec.Import)]); err != nil {
+			return err
+		}
+		r.markPublished(status, secretName, info.AccessKeyId)
+		return nil
+	}
+
+	// Created key: the secret access key cannot be recovered. Surface it instead of lying.
+	setKeyCondition(status, conditionCredentialsPublished, metav1.ConditionFalse, "CredentialsLost",
+		fmt.Sprintf("Output Secret %q is missing and the secret access key cannot be recovered "+
+			"(Garage reveals it only at creation); delete and recreate the GarageKey to rotate credentials", secretName))
+	return nil
 }
 
 // createOrImportKey creates a fresh key or imports caller-supplied credentials, returning the

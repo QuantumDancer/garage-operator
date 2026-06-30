@@ -37,6 +37,10 @@ import (
 	"github.com/QuantumDancer/garage-operator/internal/garageadmin"
 )
 
+// testImportSecretName is the Secret holding caller-supplied credentials, reused across the
+// import-key fixtures in this file.
+const testImportSecretName = "existing-creds"
+
 // fakeKeyAdmin is an in-memory stand-in for the key slice of the Admin API. It records the calls
 // the controller makes so tests can assert on convergence behaviour.
 type fakeKeyAdmin struct {
@@ -154,8 +158,11 @@ func keyCR(finalized bool, spec garagev1alpha1.GarageKeySpec) *garagev1alpha1.Ga
 	return &garagev1alpha1.GarageKey{ObjectMeta: objMeta, Spec: spec}
 }
 
-func getCredentialsSecret(t *testing.T, c client.Client, name string) *corev1.Secret {
+// getCredentialsSecret fetches the default output Secret (every fixture in this file uses
+// testKeyName's default naming, so the name isn't worth parameterizing).
+func getCredentialsSecret(t *testing.T, c client.Client) *corev1.Secret {
 	t.Helper()
+	name := testKeyName + "-credentials"
 	var s corev1.Secret
 	if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: testKeyNS}, &s); err != nil {
 		t.Fatalf("get secret %q: %v", name, err)
@@ -244,7 +251,7 @@ func TestKeyReconcileCreatesKeyAndPublishesSecret(t *testing.T) {
 		t.Fatalf("CredentialsPublished condition = %+v, want True", cond)
 	}
 
-	out := getCredentialsSecret(t, c, wantSecret)
+	out := getCredentialsSecret(t, c)
 	if string(out.Data[credAccessKeyID]) != got.Status.KeyID {
 		t.Errorf("secret accessKeyId = %q, want %q", out.Data[credAccessKeyID], got.Status.KeyID)
 	}
@@ -259,14 +266,14 @@ func TestKeyReconcileCreatesKeyAndPublishesSecret(t *testing.T) {
 func TestKeyReconcileImportsExistingCredentials(t *testing.T) {
 	cluster, secret := readyCluster()
 	importSecret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: "existing-creds", Namespace: testKeyNS},
+		ObjectMeta: metav1.ObjectMeta{Name: testImportSecretName, Namespace: testKeyNS},
 		Data: map[string][]byte{
 			credAccessKeyID:     []byte("GKIMPORTED"),
 			credSecretAccessKey: []byte("imported-secret"),
 		},
 	}
 	admin := newFakeKeyAdmin()
-	key := keyCR(true, garagev1alpha1.GarageKeySpec{Import: &garagev1alpha1.KeyImport{SecretName: "existing-creds"}})
+	key := keyCR(true, garagev1alpha1.GarageKeySpec{Import: &garagev1alpha1.KeyImport{SecretName: testImportSecretName}})
 	r, c := newKeyReconciler(t, admin, key, cluster, secret, importSecret)
 
 	reconcileKey(t, r)
@@ -278,7 +285,7 @@ func TestKeyReconcileImportsExistingCredentials(t *testing.T) {
 	if got.Status.KeyID != "GKIMPORTED" {
 		t.Errorf("status.keyId = %q, want GKIMPORTED", got.Status.KeyID)
 	}
-	out := getCredentialsSecret(t, c, testKeyName+"-credentials")
+	out := getCredentialsSecret(t, c)
 	if string(out.Data[credSecretAccessKey]) != "imported-secret" {
 		t.Errorf("published secret = %q, want imported-secret", out.Data[credSecretAccessKey])
 	}
@@ -307,6 +314,75 @@ func TestKeyReconcileAdoptsFromExistingSecret(t *testing.T) {
 	}
 	if got := getKey(t, c); got.Status.KeyID != adoptedID {
 		t.Errorf("status.keyId = %q, want %q", got.Status.KeyID, adoptedID)
+	}
+}
+
+// TestKeyEnsureFlipsConditionWhenCreatedSecretLost covers the fast path's Secret-loss repair for
+// a created key (REVIEW.md #7): status.keyId already matches a live Garage key, but the output
+// Secret has been deleted out-of-band. Since a created key's secret access key is unrecoverable
+// (Garage reveals it only once), the controller must surface the broken state by flipping
+// CredentialsPublished to False rather than keep reporting the stale True.
+func TestKeyEnsureFlipsConditionWhenCreatedSecretLost(t *testing.T) {
+	admin := newFakeKeyAdmin()
+	admin.keys[testGarageKeyID] = &garageadmin.GetKeyInfoResponse{AccessKeyId: testGarageKeyID}
+	key := keyCR(true, garagev1alpha1.GarageKeySpec{})
+	r, _ := newKeyReconciler(t, admin, key)
+
+	status := &garagev1alpha1.GarageKeyStatus{KeyID: testGarageKeyID}
+	// Seed the stale True condition a prior, successful publish would have left behind.
+	setKeyCondition(status, conditionCredentialsPublished, metav1.ConditionTrue, "CredentialsPublished", "stale")
+
+	info, err := r.ensureKey(context.Background(), admin, key, status)
+	if err != nil {
+		t.Fatalf("ensureKey: %v", err)
+	}
+	if info.AccessKeyId != testGarageKeyID {
+		t.Errorf("info.AccessKeyId = %q, want %q", info.AccessKeyId, testGarageKeyID)
+	}
+
+	cond := meta.FindStatusCondition(status.Conditions, conditionCredentialsPublished)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "CredentialsLost" {
+		t.Fatalf("CredentialsPublished condition = %+v, want False/CredentialsLost", cond)
+	}
+}
+
+// TestKeyEnsureRepublishesImportSecretWhenLost covers the fast path's Secret-loss repair for an
+// import key (REVIEW.md #7): unlike a created key, an import key's secret access key is
+// recoverable from spec.Import's Secret, so the controller must re-publish the output Secret
+// rather than give up.
+func TestKeyEnsureRepublishesImportSecretWhenLost(t *testing.T) {
+	admin := newFakeKeyAdmin()
+	admin.keys[testGarageKeyID] = &garageadmin.GetKeyInfoResponse{AccessKeyId: testGarageKeyID}
+	importSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: testImportSecretName, Namespace: testKeyNS},
+		Data: map[string][]byte{
+			credAccessKeyID:     []byte(testGarageKeyID),
+			credSecretAccessKey: []byte("imported-secret"),
+		},
+	}
+	key := keyCR(true, garagev1alpha1.GarageKeySpec{Import: &garagev1alpha1.KeyImport{SecretName: testImportSecretName}})
+	r, c := newKeyReconciler(t, admin, key, importSecret)
+
+	status := &garagev1alpha1.GarageKeyStatus{KeyID: testGarageKeyID}
+
+	info, err := r.ensureKey(context.Background(), admin, key, status)
+	if err != nil {
+		t.Fatalf("ensureKey: %v", err)
+	}
+	if info.AccessKeyId != testGarageKeyID {
+		t.Errorf("info.AccessKeyId = %q, want %q", info.AccessKeyId, testGarageKeyID)
+	}
+
+	out := getCredentialsSecret(t, c)
+	if string(out.Data[credAccessKeyID]) != testGarageKeyID {
+		t.Errorf("secret accessKeyId = %q, want %q", out.Data[credAccessKeyID], testGarageKeyID)
+	}
+	if string(out.Data[credSecretAccessKey]) != "imported-secret" {
+		t.Errorf("secret accessKey = %q, want imported-secret", out.Data[credSecretAccessKey])
+	}
+	cond := meta.FindStatusCondition(status.Conditions, conditionCredentialsPublished)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("CredentialsPublished condition = %+v, want True", cond)
 	}
 }
 
@@ -359,7 +435,7 @@ func TestKeyDeleteRetainKeepsKeyAndReleasesSecret(t *testing.T) {
 		t.Errorf("deleteCalls = %d, want 0 under Retain", admin.deleteCalls)
 	}
 	// The Secret must survive the CR (owner ref released) so retained credentials stay usable.
-	out := getCredentialsSecret(t, c, testKeyName+"-credentials")
+	out := getCredentialsSecret(t, c)
 	if owner := metav1.GetControllerOf(out); owner != nil {
 		t.Errorf("Secret still owned after Retain delete: %+v", owner)
 	}
