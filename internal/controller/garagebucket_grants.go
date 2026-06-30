@@ -51,8 +51,7 @@ func (r *GarageBucketReconciler) reconcileGrantsAndAliases(
 	bucket *garagev1alpha1.GarageBucket,
 	info *garageadmin.GetBucketInfoResponse,
 ) error {
-	pending := false
-
+	grantsPending := false
 	desiredGrants := map[string]garagev1alpha1.BucketGrant{}
 	for i := range bucket.Spec.Grants {
 		g := &bucket.Spec.Grants[i]
@@ -61,15 +60,20 @@ func (r *GarageBucketReconciler) reconcileGrantsAndAliases(
 			return err
 		}
 		if !ok {
-			pending = true
+			grantsPending = true
 			continue
 		}
 		desiredGrants[keyID] = *g
 	}
-	if err := reconcileGrants(ctx, admin, info, desiredGrants); err != nil {
+	// Only revoke keys absent from spec when every spec grant resolved: an unresolved key has no
+	// access key id, so we cannot tell its still-live Garage entry apart from a genuinely removed
+	// one. Revoking blindly would strip live permissions from a key that is still desired (e.g. a
+	// Retain-deleted key, or one mid-rotation), so defer all revocation until resolution is complete.
+	if err := reconcileGrants(ctx, admin, info, desiredGrants, !grantsPending); err != nil {
 		return err
 	}
 
+	aliasesPending := false
 	desiredAliases := map[localAliasKey]bool{}
 	for i := range bucket.Spec.LocalAliases {
 		la := &bucket.Spec.LocalAliases[i]
@@ -78,29 +82,33 @@ func (r *GarageBucketReconciler) reconcileGrantsAndAliases(
 			return err
 		}
 		if !ok {
-			pending = true
+			aliasesPending = true
 			continue
 		}
 		desiredAliases[localAliasKey{accessKeyID: keyID, alias: la.Alias}] = true
 	}
-	if err := reconcileLocalAliases(ctx, admin, info, desiredAliases); err != nil {
+	// Same reasoning as grants: defer removing unlisted aliases until every alias key resolves.
+	if err := reconcileLocalAliases(ctx, admin, info, desiredAliases, !aliasesPending); err != nil {
 		return err
 	}
 
-	if pending {
+	if grantsPending || aliasesPending {
 		return errKeyNotReady
 	}
 	return nil
 }
 
 // reconcileGrants makes the bucket authoritative over key permissions: each desired key is
-// granted exactly its read/write/owner set, and any key currently holding permissions but no
-// longer listed is fully revoked.
+// granted exactly its read/write/owner set. Keys currently holding permissions but no longer
+// listed are revoked only when revokeUnlisted is true — the caller sets it false whenever a
+// spec grant could not be resolved to an access key id this pass, since a key absent from
+// desired for that reason may still be desired in reality (see reconcileGrantsAndAliases).
 func reconcileGrants(
 	ctx context.Context,
 	admin bucketAdmin,
 	info *garageadmin.GetBucketInfoResponse,
 	desired map[string]garagev1alpha1.BucketGrant,
+	revokeUnlisted bool,
 ) error {
 	current := map[string]garageadmin.ApiBucketKeyPerm{}
 	for i := range info.Keys {
@@ -121,6 +129,9 @@ func reconcileGrants(
 		}
 	}
 
+	if !revokeUnlisted {
+		return nil
+	}
 	for keyID, perm := range current {
 		if _, ok := desired[keyID]; ok {
 			continue
@@ -173,12 +184,16 @@ func hasAnyPerm(p garageadmin.ApiBucketKeyPerm) bool {
 }
 
 // reconcileLocalAliases makes the bucket authoritative over its per-key aliases: adds every
-// desired (key, alias) pair not yet present and removes every present pair no longer desired.
+// desired (key, alias) pair not yet present. Present pairs no longer desired are removed only
+// when removeUnlisted is true — same rationale as reconcileGrants's revokeUnlisted: a key
+// missing from desired because it could not be resolved this pass may still be desired in
+// reality, so removal is deferred until every alias key resolves.
 func reconcileLocalAliases(
 	ctx context.Context,
 	admin bucketAdmin,
 	info *garageadmin.GetBucketInfoResponse,
 	desired map[localAliasKey]bool,
+	removeUnlisted bool,
 ) error {
 	current := map[localAliasKey]bool{}
 	for i := range info.Keys {
@@ -194,6 +209,9 @@ func reconcileLocalAliases(
 				return err
 			}
 		}
+	}
+	if !removeUnlisted {
+		return nil
 	}
 	for ak := range current {
 		if !desired[ak] {

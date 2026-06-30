@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -546,6 +547,70 @@ func TestBucketReconcileRevokesUnlistedGrant(t *testing.T) {
 
 	if len(admin.denyCalls) != 1 || admin.denyCalls[0] != "GK-STALE" {
 		t.Fatalf("denyCalls = %v, want [GK-STALE] (stale grant revoked)", admin.denyCalls)
+	}
+}
+
+// TestReconcileGrantsKeepsUnresolvedKeyPermissions covers REVIEW.md #2: a key still listed in
+// spec.Grants but unresolvable this pass (e.g. its GarageKey was deleted under deletionPolicy
+// Retain, or it is mid-rotation with an empty status.KeyID) has no access key id, so it is
+// omitted from desiredGrants. The revoke sweep must not mistake that omission for "removed from
+// spec" and strip the key's live Garage permissions.
+func TestReconcileGrantsKeepsUnresolvedKeyPermissions(t *testing.T) {
+	admin := newFakeBucketAdmin()
+	// No GarageKey CR is seeded, so the grant's keyRef can never resolve.
+	r, _ := newBucketReconciler(t, admin)
+
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{
+		Grants: []garagev1alpha1.BucketGrant{{KeyRef: garagev1alpha1.KeyReference{Name: testKeyName}, Read: true, Write: true}},
+	})
+	info := &garageadmin.GetBucketInfoResponse{
+		Id: testBucketID,
+		Keys: []garageadmin.GetBucketInfoKey{{
+			AccessKeyId: testGarageKeyID,
+			Permissions: garageadmin.ApiBucketKeyPerm{Read: ptr.To(true), Write: ptr.To(true)},
+		}},
+	}
+	// fakeBucketAdmin.DenyBucketKey writes its bookkeeping through admin.buckets[id], so the
+	// bucket must be registered there even though the call under test takes info directly.
+	admin.buckets[testBucketID] = info
+
+	err := r.reconcileGrantsAndAliases(context.Background(), admin, bucket, info)
+	if !errors.Is(err, errKeyNotReady) {
+		t.Fatalf("reconcileGrantsAndAliases error = %v, want errKeyNotReady", err)
+	}
+	if len(admin.denyCalls) != 0 {
+		t.Fatalf("denyCalls = %v, want none (key unresolved this pass, its live grant must survive)", admin.denyCalls)
+	}
+}
+
+// TestReconcileLocalAliasesKeepsUnresolvedKeyAlias is the local-alias twin of
+// TestReconcileGrantsKeepsUnresolvedKeyPermissions: same unresolvable-key setup, but exercising
+// the alias removal sweep instead of the grant revoke sweep.
+func TestReconcileLocalAliasesKeepsUnresolvedKeyAlias(t *testing.T) {
+	admin := newFakeBucketAdmin()
+	// No GarageKey CR is seeded, so the alias's keyRef can never resolve.
+	r, _ := newBucketReconciler(t, admin)
+
+	bucket := bucketCR(true, garagev1alpha1.GarageBucketSpec{
+		LocalAliases: []garagev1alpha1.LocalAlias{{KeyRef: garagev1alpha1.KeyReference{Name: testKeyName}, Alias: "myalias"}},
+	})
+	info := &garageadmin.GetBucketInfoResponse{
+		Id: testBucketID,
+		Keys: []garageadmin.GetBucketInfoKey{{
+			AccessKeyId:        testGarageKeyID,
+			BucketLocalAliases: []string{"myalias"},
+		}},
+	}
+	// fakeBucketAdmin.RemoveBucketLocalAlias writes its bookkeeping through admin.buckets[id], so
+	// the bucket must be registered there even though the call under test takes info directly.
+	admin.buckets[testBucketID] = info
+
+	err := r.reconcileGrantsAndAliases(context.Background(), admin, bucket, info)
+	if !errors.Is(err, errKeyNotReady) {
+		t.Fatalf("reconcileGrantsAndAliases error = %v, want errKeyNotReady", err)
+	}
+	if len(admin.removedLocalAlias) != 0 {
+		t.Fatalf("removedLocalAlias = %v, want none (key unresolved this pass, its live alias must survive)", admin.removedLocalAlias)
 	}
 }
 
