@@ -104,13 +104,16 @@ func globalAliasBody(bucketID, alias string) (BucketAliasEnum, error) {
 }
 
 // DeleteBucket deletes a bucket by id. Garage refuses to delete a non-empty bucket, which
-// surfaces here as a non-200 status; callers gate deletion on emptiness beforehand.
+// surfaces here as a non-200 status; callers gate deletion on emptiness beforehand. A 404 is
+// treated as success so deletion is idempotent when the bucket is already gone (e.g. a
+// retried finalizer pass).
 func (c *AdminClient) DeleteBucket(ctx context.Context, id string) error {
 	resp, err := c.DeleteBucketWithResponse(ctx, &DeleteBucketParams{Id: id})
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode() != http.StatusOK {
+	if resp.StatusCode() != http.StatusOK && resp.StatusCode() != http.StatusNoContent &&
+		resp.StatusCode() != http.StatusNotFound {
 		return fmt.Errorf("DeleteBucket: unexpected status %s", resp.Status())
 	}
 	return nil
