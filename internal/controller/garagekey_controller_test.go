@@ -53,6 +53,10 @@ func newFakeKeyAdmin() *fakeKeyAdmin {
 	return &fakeKeyAdmin{keys: map[string]*garageadmin.GetKeyInfoResponse{}}
 }
 
+func (f *fakeKeyAdmin) NodeID(context.Context) (string, error) {
+	return "fake-node", nil
+}
+
 func (f *fakeKeyAdmin) GetKeyByID(_ context.Context, id string) (*garageadmin.GetKeyInfoResponse, bool, error) {
 	k, ok := f.keys[id]
 	return k, ok, nil

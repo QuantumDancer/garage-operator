@@ -58,6 +58,8 @@ const (
 // keyAdmin is the slice of the Garage Admin API the key controller needs, behind an interface
 // so reconcile logic can be exercised against a fake in tests.
 type keyAdmin interface {
+	NodeID(ctx context.Context) (string, error)
+
 	GetKeyByID(ctx context.Context, id string) (*garageadmin.GetKeyInfoResponse, bool, error)
 	CreateKey(ctx context.Context, body garageadmin.CreateKeyRequest) (*garageadmin.GetKeyInfoResponse, error)
 	ImportKey(ctx context.Context, body garageadmin.ImportKeyRequest) (*garageadmin.GetKeyInfoResponse, error)
@@ -146,9 +148,11 @@ func (r *GarageKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return r.finish(ctx, &key, status, ctrl.Result{RequeueAfter: clusterPendingRequeue})
 	}
 
-	admin, err := r.NewAdminClient(conn.baseURL, conn.token)
+	admin, err := firstReachableAdmin(ctx, r.NewAdminClient, conn.baseURLs, conn.token)
 	if err != nil {
-		return ctrl.Result{}, err
+		log.Info("No reachable Garage admin endpoint; requeuing", "error", err.Error())
+		setKeyCondition(status, conditionReady, metav1.ConditionFalse, reasonClusterUnreachable, err.Error())
+		return r.finish(ctx, &key, status, ctrl.Result{RequeueAfter: clusterPendingRequeue})
 	}
 
 	if err := r.converge(ctx, admin, &key, status); err != nil {
@@ -333,9 +337,10 @@ func (r *GarageKeyReconciler) reconcileDelete(ctx context.Context, key *garagev1
 			log.Info("Waiting for referenced cluster to become Ready before deleting key")
 			return ctrl.Result{RequeueAfter: clusterPendingRequeue}, nil
 		default:
-			admin, err := r.NewAdminClient(conn.baseURL, conn.token)
+			admin, err := firstReachableAdmin(ctx, r.NewAdminClient, conn.baseURLs, conn.token)
 			if err != nil {
-				return ctrl.Result{}, err
+				log.Info("No reachable Garage admin endpoint; requeuing key deletion", "error", err.Error())
+				return ctrl.Result{RequeueAfter: clusterPendingRequeue}, nil
 			}
 			if err := admin.DeleteKey(ctx, key.Status.KeyID); err != nil {
 				return ctrl.Result{}, err

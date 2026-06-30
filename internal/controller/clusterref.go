@@ -48,9 +48,10 @@ const (
 )
 
 // clusterConnection is everything a bucket/key controller needs to reach a cluster's Admin API.
+// baseURLs is ordered most-preferred first; callers try each in turn via firstReachableAdmin.
 type clusterConnection struct {
-	baseURL string
-	token   string
+	baseURLs []string
+	token    string
 }
 
 // resolveClusterConnection loads the GarageCluster named by ref (defaulting the namespace to
@@ -92,15 +93,64 @@ func resolveClusterConnection(
 			fmt.Errorf("admin token Secret %q is missing key %q", tokenRef.name, tokenRef.key)
 	}
 
-	return clusterConnection{baseURL: clusterAdminBaseURL(&cluster), token: string(token)}, resolveReady, nil
+	return clusterConnection{baseURLs: clusterAdminBaseURLs(&cluster), token: string(token)}, resolveReady, nil
 }
 
-// clusterAdminBaseURL is the Admin API URL of the first pool's node 0, addressed over per-pod
-// headless DNS. The admin API must be reached at a specific pod, never a load-balanced
-// Service: some admin operations are node-local, and the layout is cluster-wide so any single
-// reachable node serves bucket/key calls.
-func clusterAdminBaseURL(c *garagev1alpha1.GarageCluster) string {
-	pool := &c.Spec.NodePools[0]
-	pod := fmt.Sprintf("%s-0", statefulSetName(c, pool))
+// adminURLForPod is the Admin API URL of one pod, addressed over per-pod headless DNS.
+func adminURLForPod(c *garagev1alpha1.GarageCluster, pod string) string {
 	return fmt.Sprintf("http://%s.%s.%s.svc:%d", pod, headlessServiceName(c), c.Namespace, portAdmin)
+}
+
+// clusterAdminBaseURLs returns the candidate Admin API endpoints for a cluster's bucket/key
+// operations, most-preferred first. The admin API must be reached at a specific pod (never a
+// load-balanced Service): some operations are node-local, but the layout is cluster-wide so any
+// single reachable node serves bucket/key calls. Prefer the laid-out nodes from status so a
+// single down pod no longer wedges every operation; before the first layout is recorded, fall
+// back to pool-0/pod-0.
+func clusterAdminBaseURLs(c *garagev1alpha1.GarageCluster) []string {
+	if c.Status.Layout != nil && len(c.Status.Layout.Nodes) > 0 {
+		urls := make([]string, 0, len(c.Status.Layout.Nodes))
+		for i := range c.Status.Layout.Nodes {
+			urls = append(urls, adminURLForPod(c, c.Status.Layout.Nodes[i].Pod))
+		}
+		return urls
+	}
+	pod := fmt.Sprintf("%s-0", statefulSetName(c, &c.Spec.NodePools[0]))
+	return []string{adminURLForPod(c, pod)}
+}
+
+// reachableProbe is satisfied by any admin client that can confirm its endpoint is answering.
+type reachableProbe interface {
+	NodeID(ctx context.Context) (string, error)
+}
+
+// firstReachableAdmin builds an admin client for each candidate endpoint in turn and returns the
+// first whose node answers a NodeID probe — the same liveness check discoverNodes uses. Bucket
+// and key admin operations are cluster-wide, so any reachable node serves them; this removes the
+// single-pod SPOF of always targeting pool-0/pod-0. It errors only when NO candidate is
+// reachable, which callers treat as "requeue", never as "cluster gone" (so no finalizer drops).
+func firstReachableAdmin[T reachableProbe](
+	ctx context.Context,
+	factory func(baseURL, token string) (T, error),
+	baseURLs []string,
+	token string,
+) (T, error) {
+	var zero T
+	var lastErr error
+	for _, baseURL := range baseURLs {
+		admin, err := factory(baseURL, token)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if _, err := admin.NodeID(ctx); err != nil {
+			lastErr = err
+			continue
+		}
+		return admin, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no candidate admin endpoints")
+	}
+	return zero, fmt.Errorf("no reachable Garage admin endpoint: %w", lastErr)
 }

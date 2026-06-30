@@ -59,11 +59,16 @@ const (
 	// reasonReferenceNotAllowed marks a bucket/key whose namespace is forbidden from
 	// referencing its target cluster by that cluster's spec.referencePolicy.
 	reasonReferenceNotAllowed = "ReferenceNotAllowed"
+	// reasonClusterUnreachable marks a bucket/key whose cluster is Ready but none of its
+	// candidate admin endpoints answered a NodeID probe (see firstReachableAdmin).
+	reasonClusterUnreachable = "ClusterUnreachable"
 )
 
 // bucketAdmin is the slice of the Garage Admin API the bucket controller needs. It is an
 // interface so reconcile logic can be exercised against a fake in tests.
 type bucketAdmin interface {
+	NodeID(ctx context.Context) (string, error)
+
 	GetBucketByID(ctx context.Context, id string) (*garageadmin.GetBucketInfoResponse, bool, error)
 	GetBucketByGlobalAlias(ctx context.Context, alias string) (*garageadmin.GetBucketInfoResponse, bool, error)
 	CreateBucket(ctx context.Context, globalAlias string) (string, error)
@@ -161,9 +166,11 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.finish(ctx, &bucket, status, ctrl.Result{RequeueAfter: clusterPendingRequeue})
 	}
 
-	admin, err := r.NewAdminClient(conn.baseURL, conn.token)
+	admin, err := firstReachableAdmin(ctx, r.NewAdminClient, conn.baseURLs, conn.token)
 	if err != nil {
-		return ctrl.Result{}, err
+		log.Info("No reachable Garage admin endpoint; requeuing", "error", err.Error())
+		setBucketCondition(status, metav1.ConditionFalse, reasonClusterUnreachable, err.Error())
+		return r.finish(ctx, &bucket, status, ctrl.Result{RequeueAfter: clusterPendingRequeue})
 	}
 
 	if err := r.converge(ctx, admin, &bucket, status); err != nil {
@@ -283,9 +290,10 @@ func (r *GarageBucketReconciler) reconcileDelete(ctx context.Context, bucket *ga
 		return ctrl.Result{RequeueAfter: clusterPendingRequeue}, nil
 	}
 
-	admin, err := r.NewAdminClient(conn.baseURL, conn.token)
+	admin, err := firstReachableAdmin(ctx, r.NewAdminClient, conn.baseURLs, conn.token)
 	if err != nil {
-		return ctrl.Result{}, err
+		log.Info("No reachable Garage admin endpoint; requeuing bucket deletion", "error", err.Error())
+		return ctrl.Result{RequeueAfter: clusterPendingRequeue}, nil
 	}
 
 	info, found, err := admin.GetBucketByID(ctx, bucket.Status.BucketID)
