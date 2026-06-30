@@ -56,6 +56,11 @@ type fakeLayout struct {
 	applyCalls  int
 	previewMsg  []string
 
+	// ops records the layout mutating calls in order ("revert", "stage", "apply") across the
+	// per-pod clients a reconcile creates, so a test can assert a revert precedes the stage in an
+	// apply path (REVIEW.md #8).
+	ops []string
+
 	// redundancy is the applied zone-redundancy parameter, defaulting to Garage's Maximum.
 	// redundancyCalls counts how many times the controller applied a change to it.
 	redundancy      garageadmin.ZoneRedundancyValue
@@ -201,6 +206,7 @@ func (f *fakeClusterAdmin) PlanLayout(_ context.Context, desired []garageadmin.D
 }
 
 func (f *fakeClusterAdmin) StageLayoutChanges(context.Context, []garageadmin.NodeRoleChangeRequest) error {
+	f.layout.ops = append(f.layout.ops, "stage")
 	return nil
 }
 
@@ -209,11 +215,15 @@ func (f *fakeClusterAdmin) PreviewStagedChanges(context.Context) ([]string, erro
 }
 
 func (f *fakeClusterAdmin) ApplyLayout(_ context.Context, version int64) error {
+	f.layout.ops = append(f.layout.ops, "apply")
 	f.layout.apply(version)
 	return nil
 }
 
-func (f *fakeClusterAdmin) RevertStagedChanges(context.Context) error { return nil }
+func (f *fakeClusterAdmin) RevertStagedChanges(context.Context) error {
+	f.layout.ops = append(f.layout.ops, "revert")
+	return nil
+}
 
 func (f *fakeClusterAdmin) CurrentZoneRedundancy(context.Context) (garageadmin.ZoneRedundancyValue, error) {
 	return f.layout.redundancy, nil
@@ -1145,6 +1155,86 @@ var _ = Describe("GarageCluster surplus-workload teardown retried in the additiv
 		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
 		Expect(cluster.Status.Layout.Nodes).To(HaveLen(2))
 		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady)).To(BeTrue())
+	})
+})
+
+var _ = Describe("GarageCluster additive layout apply reverts stale staged changes first", Ordered, func() {
+	// Regression guard for REVIEW.md #8: the additive apply path staged and applied without first
+	// reverting, unlike every other apply path. A prior reconcile that staged changes then crashed
+	// before ApplyLayout leaves them staged; PlanLayout diffs only the APPLIED layout, so it never
+	// sees them and never re-stages or reverts them. A later additive change would then
+	// ApplyLayout(version+1) over the UNION, committing the abandoned change the user never
+	// approved. The fix calls RevertStagedChanges before StageLayoutChanges, so the apply commits
+	// exactly this plan. This asserts the ordering on the first converge (itself an additive apply).
+	const (
+		resourceName      = "addrevert"
+		resourceNamespace = "default"
+		ssName            = "addrevert-default"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), layout: layout}, nil
+			},
+		}
+	}
+
+	markReady := func() {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = 1
+		ss.Status.ReadyReplicas = 1
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(1, 1),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("reverts staged changes before staging this plan's additive changes", func() {
+		By("provisioning the workload (pods not yet ready, so the layout step is not reached)")
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.ops).To(BeEmpty(), "no layout mutation before pods are ready")
+
+		By("marking the StatefulSet ready and reconciling into the additive apply")
+		markReady()
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+
+		By("calling RevertStagedChanges before StageLayoutChanges in the additive apply")
+		revertIdx := -1
+		stageIdx := -1
+		for i, op := range layout.ops {
+			if op == "revert" && revertIdx == -1 {
+				revertIdx = i
+			}
+			if op == "stage" && stageIdx == -1 {
+				stageIdx = i
+			}
+		}
+		Expect(revertIdx).NotTo(Equal(-1), "additive apply must revert stale staged changes")
+		Expect(stageIdx).NotTo(Equal(-1), "additive apply must stage this plan's changes")
+		Expect(revertIdx).To(BeNumerically("<", stageIdx), "revert must precede stage so the apply commits only this plan, never a stale union")
 	})
 })
 

@@ -51,6 +51,14 @@ func (r *GarageClusterReconciler) reconcileLayout(ctx context.Context, cluster *
 	if !plan.IsDestructive() {
 		version := plan.CurrentVersion
 		if plan.HasChanges() {
+			// Clear anything a prior crash may have left staged first, so the apply commits exactly
+			// this plan. PlanLayout diffs only the applied layout, so a change staged-but-never-applied
+			// by a crashed pass (then reverted in spec) is invisible to the diff yet would ride along
+			// in the version+1 union this ApplyLayout commits — applying a change the user never approved.
+			if err := layoutClient.RevertStagedChanges(ctx); err != nil {
+				setCondition(status, conditionLayoutApplied, metav1.ConditionFalse, "LayoutError", err.Error())
+				return err
+			}
 			if err := layoutClient.StageLayoutChanges(ctx, plan.AdditiveChanges); err != nil {
 				setCondition(status, conditionLayoutApplied, metav1.ConditionFalse, "LayoutError", err.Error())
 				return err
