@@ -28,6 +28,7 @@ import (
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -45,11 +46,14 @@ import (
 // fully re-replicated, recreate the node's volumes at the new spec, and re-add the node so
 // Garage refills it. The per-node progress lives in status.storageMigration.
 //
-// It returns active=true while any pool needs migrating — in progress *or* blocked by a
-// guardrail — to tell Reconcile to skip the generic layout reconciliation and requeue: the
-// migration owns the layout for the node it is moving, and suppressing the generic path keeps
-// it from applying the node's new (smaller/larger) capacity before the volume actually exists.
-// active=false means there is nothing to migrate and the caller proceeds normally.
+// It returns active=true while a pool's migration is in progress, telling Reconcile to skip the
+// generic layout reconciliation and requeue: the migration owns the layout for the node it is
+// moving, and suppressing the generic path keeps it from applying the node's new (smaller/larger)
+// capacity before the volume actually exists. A migration refused by a guardrail instead returns
+// active=false once the blocked pool's capacity is pinned to its current (unmigrated) value, so an
+// impossible storage edit no longer freezes every unrelated cluster operation (REVIEW.md #5); the
+// refusal is surfaced via the StorageChangePending=False/Blocked condition. active=false also
+// means there was simply nothing to migrate.
 //
 // desired carries the nodes discovered this pass (pod -> node id -> zone -> new capacity); the
 // migration reads it to learn a node's current id and the role to re-add it with.
@@ -145,7 +149,7 @@ func (r *GarageClusterReconciler) migrationDrain(ctx context.Context, cluster *g
 	// Guardrail: draining a node temporarily removes a replica, so with replicationFactor < 2
 	// the node's data exists nowhere else and recreating its volume is unrecoverable loss.
 	if cluster.Spec.ReplicationFactor < 2 {
-		return r.blockMigration(cluster, status,
+		return r.blockMigration(cluster, status, desired, step.pool,
 			fmt.Sprintf("Refusing storage migration of pool %q: replicationFactor %d leaves no replica to recover a drained node's data",
 				step.pool.Name, cluster.Spec.ReplicationFactor)), nil
 	}
@@ -159,7 +163,7 @@ func (r *GarageClusterReconciler) migrationDrain(ctx context.Context, cluster *g
 	if reason, err := r.unresolvableStorageClass(ctx, step.pool); err != nil {
 		return false, err
 	} else if reason != "" {
-		return r.blockMigration(cluster, status,
+		return r.blockMigration(cluster, status, desired, step.pool,
 			fmt.Sprintf("Refusing storage migration of pool %q: %s", step.pool.Name, reason)), nil
 	}
 
@@ -177,7 +181,7 @@ func (r *GarageClusterReconciler) migrationDrain(ctx context.Context, cluster *g
 		// Still in the layout: the drain has not happened yet, so refuse to start it from an
 		// already-degraded cluster (a drain reduces redundancy further).
 		if status.Health == nil || status.Health.Status != healthStatusHealthy {
-			return r.blockMigration(cluster, status,
+			return r.blockMigration(cluster, status, desired, step.pool,
 				fmt.Sprintf("Refusing to start storage migration of pool %q node %d while the cluster is not healthy", step.pool.Name, step.ordinal)), nil
 		}
 		if err := layoutClient.RemoveNode(ctx, node.nodeID); err != nil {
@@ -362,16 +366,53 @@ func (r *GarageClusterReconciler) migrationAwaitRejoin(ctx context.Context, clus
 	return true, nil
 }
 
-// blockMigration records a guardrail refusal: it sets StorageChangePending=False/Blocked, emits
-// a Warning Event, and clears the in-progress record (nothing is mid-flight — the migration
-// never started). It returns active=true so the caller still suppresses the generic layout
-// path, keeping the node's pending capacity change from being applied while the volume is
-// unchanged.
-func (r *GarageClusterReconciler) blockMigration(cluster *garagev1alpha1.GarageCluster, status *garagev1alpha1.GarageClusterStatus, msg string) bool {
+// blockMigration records a guardrail refusal of a pool's storage migration: it sets
+// StorageChangePending=False/Blocked, emits a Warning Event, and clears any in-progress record
+// (nothing is mid-flight — the migration never started).
+//
+// It then pins the blocked pool's node capacities in desired to their current applied-layout value
+// and returns active=false, so Reconcile falls through to the generic layout/zone/maintenance
+// steps instead of freezing: only the affected pool's capacity change is suppressed, not every
+// unrelated cluster operation (REVIEW.md #5). The pin is what makes unfreezing safe — without it
+// reconcileLayout would advertise the pool's new (still-unmigrated) capacity to Garage, and a
+// blocked grow would claim more disk than the node actually has, over-filling it. If the pool's
+// nodes cannot all be pinned (no prior layout entry to pin to), it returns active=true instead,
+// preserving the old safe-but-frozen behavior rather than risk advertising an unmigrated size.
+func (r *GarageClusterReconciler) blockMigration(cluster *garagev1alpha1.GarageCluster, status *garagev1alpha1.GarageClusterStatus, desired []nodeEndpoint, pool *garagev1alpha1.NodePool, msg string) bool {
 	setCondition(status, conditionStorageChangePending, metav1.ConditionFalse, reasonBlocked, msg)
 	r.eventf(cluster, corev1.EventTypeWarning, "StorageChangeBlocked", msg)
 	status.StorageMigration = nil
-	return true
+	return !pinBlockedPoolCapacityToCurrent(cluster, status, desired, pool)
+}
+
+// pinBlockedPoolCapacityToCurrent rewrites the blocked pool's node capacities in desired back to
+// their current applied-layout value, so reconcileLayout does not advance an unmigrated pool's
+// capacity (a blocked grow would otherwise advertise more disk than the node has, since its volume
+// has not been recreated yet). It matches the pool's discovered nodes by pod-name prefix and reads
+// the current value from status.Layout, which echoes the last applied layout. It returns true only
+// if every one of the pool's discovered nodes had a current value to pin to; a node missing from
+// status.Layout cannot be pinned, so the caller keeps the whole reconcile frozen as a fallback.
+func pinBlockedPoolCapacityToCurrent(cluster *garagev1alpha1.GarageCluster, status *garagev1alpha1.GarageClusterStatus, desired []nodeEndpoint, pool *garagev1alpha1.NodePool) bool {
+	if status.Layout == nil {
+		return false
+	}
+	currentByPod := make(map[string]resource.Quantity, len(status.Layout.Nodes))
+	for _, n := range status.Layout.Nodes {
+		currentByPod[n.Pod] = n.Capacity
+	}
+	prefix := statefulSetName(cluster, pool) + "-"
+	allPinned := true
+	for i := range desired {
+		if !strings.HasPrefix(desired[i].pod, prefix) {
+			continue
+		}
+		if cur, ok := currentByPod[desired[i].pod]; ok {
+			desired[i].capacity = cur
+		} else {
+			allPinned = false
+		}
+	}
+	return allPinned
 }
 
 // setMigrationStatus stamps the current node/phase/message onto status. It rebuilds the whole

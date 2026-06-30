@@ -1147,3 +1147,123 @@ var _ = Describe("GarageCluster surplus-workload teardown retried in the additiv
 		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady)).To(BeTrue())
 	})
 })
+
+var _ = Describe("GarageCluster blocked storage migration does not freeze unrelated ops", Ordered, func() {
+	// Regression guard for REVIEW.md #5: a storage migration refused by a guardrail used to return
+	// active=true, so Reconcile reported Ready/StorageMigrating and returned BEFORE the generic
+	// layout/zone/maintenance steps — freezing every unrelated cluster operation until the user
+	// reverted the impossible storage edit. The fix pins the blocked pool's capacity to its current
+	// applied value and lets the reconcile fall through, so only the affected pool's capacity change
+	// is suppressed. The pin is the safety half: reconcileLayout must NOT advertise the pool's new
+	// (unmigrated) size to Garage — a blocked grow would otherwise claim more disk than the node has.
+	const (
+		resourceName      = "smblock"
+		resourceNamespace = "default"
+		ssName            = "smblock-default"
+		nodeID            = "id-smblock-default-0"
+		podZeroName       = "smblock-default-0"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), layout: layout}, nil
+			},
+		}
+	}
+
+	markReady := func() {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = 1
+		ss.Status.ReadyReplicas = 1
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		// A single-node rf=1 cluster: rf<2 is exactly the guardrail that refuses a migration drain.
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(1, 1),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+		By("converging the cluster to Ready with a 1Gi data volume laid out")
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		markReady()
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(1))
+		Expect(cluster.Status.Layout.Nodes[0].Capacity.Cmp(apiresource.MustParse("1Gi"))).To(Equal(0))
+
+		By("standing up the live PVCs the StatefulSet controller would have created (at 1Gi)")
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			createPVC(ctx, resourceNamespace, fmt.Sprintf("%s-%s-0", vol, ssName))
+		}
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("applies an unrelated zone-redundancy change while refusing the impossible shrink", func() {
+		By("shrinking the data volume (selects a migration the rf=1 guardrail refuses) and changing zone redundancy in the same edit")
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Spec.NodePools[0].Storage.Data.Size = apiresource.MustParse("512Mi")
+		cluster.Spec.ZoneRedundancy = &garagev1alpha1.ZoneRedundancy{
+			Mode: garagev1alpha1.ZoneRedundancyAtLeast, AtLeast: 1,
+		}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		redundancyBefore := layout.redundancyCalls
+		applyBefore := layout.applyCalls
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("refusing the shrink: StorageChangePending=False/Blocked")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		blocked := meta.FindStatusCondition(cluster.Status.Conditions, conditionStorageChangePending)
+		Expect(blocked).NotTo(BeNil())
+		Expect(blocked.Status).To(Equal(metav1.ConditionFalse))
+		Expect(blocked.Reason).To(Equal(reasonBlocked))
+
+		By("no longer freezing the reconcile: the unrelated zone-redundancy change is applied")
+		Expect(layout.redundancyCalls).To(Equal(redundancyBefore + 1))
+
+		By("not applying any layout change for the blocked pool")
+		Expect(layout.applyCalls).To(Equal(applyBefore))
+
+		By("pinning the blocked pool's layout capacity to its current 1Gi value, not advancing it to the new 512Mi")
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(1))
+		Expect(cluster.Status.Layout.Nodes[0].Pod).To(Equal(podZeroName))
+		Expect(cluster.Status.Layout.Nodes[0].Capacity.Cmp(apiresource.MustParse("1Gi"))).To(Equal(0))
+
+		By("advertising the pinned 1Gi capacity to Garage's PlanLayout, never the unmigrated 512Mi")
+		var role *garageadmin.DesiredRole
+		for i := range layout.lastDesired {
+			if layout.lastDesired[i].NodeID == nodeID {
+				role = &layout.lastDesired[i]
+			}
+		}
+		Expect(role).NotTo(BeNil())
+		oneGi := apiresource.MustParse("1Gi")
+		Expect(role.Capacity).To(Equal(oneGi.Value()))
+
+		By("keeping the cluster Ready: it is healthy, only the storage edit is refused")
+		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady)).To(BeTrue())
+	})
+})
