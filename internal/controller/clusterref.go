@@ -96,9 +96,14 @@ func resolveClusterConnection(
 	return clusterConnection{baseURLs: clusterAdminBaseURLs(&cluster), token: string(token)}, resolveReady, nil
 }
 
+// podDNSName is a pod's stable per-pod headless DNS name, "<pod>.<headless>.<ns>.svc".
+func podDNSName(c *garagev1alpha1.GarageCluster, pod string) string {
+	return fmt.Sprintf("%s.%s.%s.svc", pod, headlessServiceName(c), c.Namespace)
+}
+
 // adminURLForPod is the Admin API URL of one pod, addressed over per-pod headless DNS.
 func adminURLForPod(c *garagev1alpha1.GarageCluster, pod string) string {
-	return fmt.Sprintf("http://%s.%s.%s.svc:%d", pod, headlessServiceName(c), c.Namespace, portAdmin)
+	return fmt.Sprintf("http://%s:%d", podDNSName(c, pod), portAdmin)
 }
 
 // clusterAdminBaseURLs returns the candidate Admin API endpoints for a cluster's bucket/key
@@ -115,7 +120,7 @@ func clusterAdminBaseURLs(c *garagev1alpha1.GarageCluster) []string {
 		}
 		return urls
 	}
-	pod := fmt.Sprintf("%s-0", statefulSetName(c, &c.Spec.NodePools[0]))
+	pod := podName(statefulSetName(c, &c.Spec.NodePools[0]), 0)
 	return []string{adminURLForPod(c, pod)}
 }
 

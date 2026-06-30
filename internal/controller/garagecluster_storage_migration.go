@@ -439,14 +439,12 @@ func (r *GarageClusterReconciler) setMigrationStatus(status *garagev1alpha1.Gara
 // each node's live PVCs against the desired pool spec. Expandable grows are excluded: those are
 // the in-place path's job (and the StatefulSet is recreated only once Path A has patched every
 // PVC). A node whose PVC is not yet provisioned is skipped rather than treated as a target.
+//
+// classifyVolume (garagecluster_storage.go) encodes the same in-place-vs-migration classification
+// against the StatefulSet template rather than a node's live PVCs; keep the two in lockstep when
+// this logic changes.
 func (r *GarageClusterReconciler) poolMigrationTarget(ctx context.Context, cluster *garagev1alpha1.GarageCluster, pool *garagev1alpha1.NodePool, ss *appsv1.StatefulSet) (int32, bool, error) {
-	volumes := []struct {
-		name string
-		spec garagev1alpha1.StorageSpec
-	}{
-		{volumeNameData, pool.Storage.Data},
-		{volumeNameMeta, pool.Storage.Meta},
-	}
+	volumes := poolVolumes(pool)
 	for ordinal := int32(0); ordinal < replicaCount(ss); ordinal++ {
 		for _, v := range volumes {
 			pvc, err := r.claim(ctx, cluster.Namespace, ss.Name, v.name, ordinal)
@@ -526,13 +524,7 @@ const (
 // alone — deleting it then would loop-delete the fresh, still-Pending replacement.
 func (r *GarageClusterReconciler) ordinalVolumeState(ctx context.Context, cluster *garagev1alpha1.GarageCluster, pool *garagev1alpha1.NodePool, ordinal int32) (ordinalVolumeState, error) {
 	ssName := statefulSetName(cluster, pool)
-	volumes := []struct {
-		name string
-		spec garagev1alpha1.StorageSpec
-	}{
-		{volumeNameData, pool.Storage.Data},
-		{volumeNameMeta, pool.Storage.Meta},
-	}
+	volumes := poolVolumes(pool)
 	allMatch := true
 	oldClaimPresent := false
 	for _, v := range volumes {

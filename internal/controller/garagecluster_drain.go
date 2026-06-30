@@ -145,7 +145,9 @@ func (r *GarageClusterReconciler) reconcileZoneRedundancy(ctx context.Context, c
 		// Guardrail: mode AtLeast requires a positive atLeast. The kubebuilder Minimum=1 marker is
 		// only enforced when the field is present, so `{mode: AtLeast}` with atLeast omitted slips
 		// through admission as 0. Refuse it here rather than ship a nonsensical atLeast:0 to Garage
-		// (a validating webhook will reject it at admission in Phase 6).
+		// (the CEL XValidation marker on ZoneRedundancy, api/v1alpha1/garagecluster_types.go, already
+		// rejects this at admission; this check is defense-in-depth for CRs that predate the marker
+		// or if admission validation is ever bypassed).
 		if want.AtLeast < 1 {
 			msg := "Invalid zone redundancy: mode AtLeast requires atLeast >= 1"
 			setCondition(status, conditionLayoutApplied, metav1.ConditionFalse, "ZoneRedundancyInvalid", msg)

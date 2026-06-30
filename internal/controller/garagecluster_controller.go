@@ -471,12 +471,12 @@ func (r *GarageClusterReconciler) discoverNodes(ctx context.Context, cluster *ga
 	for i := range cluster.Spec.NodePools {
 		pool := &cluster.Spec.NodePools[i]
 		for ordinal := int32(0); ordinal < pool.Replicas; ordinal++ {
-			podName := fmt.Sprintf("%s-%d", statefulSetName(cluster, pool), ordinal)
-			zone, err := r.resolveZone(ctx, cluster, pool, podName)
+			pod := podName(statefulSetName(cluster, pool), ordinal)
+			zone, err := r.resolveZone(ctx, cluster, pool, pod)
 			if err != nil {
 				return nil, nil, err
 			}
-			baseURL := fmt.Sprintf("http://%s.%s.%s.svc:%d", podName, headlessServiceName(cluster), cluster.Namespace, portAdmin)
+			baseURL := adminURLForPod(cluster, pod)
 			admin, err := r.NewAdminClient(baseURL, token)
 			if err != nil {
 				return nil, nil, err
@@ -485,10 +485,10 @@ func (r *GarageClusterReconciler) discoverNodes(ctx context.Context, cluster *ga
 			if err != nil {
 				// The node's admin API is unreachable. resolveZone above reads Kubernetes objects,
 				// not Garage, so the live zone is still trustworthy for a down node.
-				if cached, ok := layoutNodeForPod(cluster, podName); ok {
-					log.Info("Garage node is unreachable; proceeding with its last-known layout entry", "node", podName, "nodeID", cached.NodeID)
+				if cached, ok := layoutNodeForPod(cluster, pod); ok {
+					log.Info("Garage node is unreachable; proceeding with its last-known layout entry", "node", pod, "nodeID", cached.NodeID)
 					nodes = append(nodes, nodeEndpoint{
-						pod:       podName,
+						pod:       pod,
 						nodeID:    cached.NodeID,
 						zone:      zone,
 						capacity:  pool.Storage.Data.Size,
@@ -498,14 +498,14 @@ func (r *GarageClusterReconciler) discoverNodes(ctx context.Context, cluster *ga
 				}
 				// Never laid out, so it is a pending addition rather than a removal — excluding it
 				// is safe, and it has no node id to contribute anyway.
-				log.Info("New Garage node is not reachable yet; skipping until it answers", "node", podName)
+				log.Info("New Garage node is not reachable yet; skipping until it answers", "node", pod)
 				continue
 			}
 			if layoutClient == nil {
 				layoutClient = admin
 			}
 			nodes = append(nodes, nodeEndpoint{
-				pod:       podName,
+				pod:       pod,
 				nodeID:    nodeID,
 				zone:      zone,
 				capacity:  pool.Storage.Data.Size,
@@ -609,7 +609,7 @@ func peerConnectStrings(cluster *garagev1alpha1.GarageCluster, nodes []nodeEndpo
 			connectFromSeen = true
 			continue
 		}
-		host := fmt.Sprintf("%s.%s.%s.svc", n.pod, headlessServiceName(cluster), cluster.Namespace)
+		host := podDNSName(cluster, n.pod)
 		peers = append(peers, fmt.Sprintf("%s@%s:%d", n.nodeID, host, portRPC))
 	}
 	if len(peers) == 0 {
