@@ -131,6 +131,10 @@ type fakeClusterAdmin struct {
 	// health, when set, overrides the default healthy response so migration tests can drive the
 	// partition counts the re-replication wait reads.
 	health *garageadmin.GetClusterHealthResponse
+
+	// planErr, when set, makes PlanLayout fail so a test can drive the reconcileLayout error
+	// path (the first Admin call reconcileLayout makes).
+	planErr error
 }
 
 func (f *fakeClusterAdmin) CreateMetadataSnapshot(context.Context, string) (garageadmin.MultiNodeResult, error) {
@@ -176,6 +180,9 @@ func (f *fakeClusterAdmin) ConnectNodes(_ context.Context, peers []string) error
 }
 
 func (f *fakeClusterAdmin) PlanLayout(_ context.Context, desired []garageadmin.DesiredRole) (*garageadmin.LayoutPlan, error) {
+	if f.planErr != nil {
+		return nil, f.planErr
+	}
 	return f.layout.plan(desired), nil
 }
 
@@ -380,6 +387,40 @@ var _ = Describe("GarageCluster Controller", Ordered, func() {
 	It("is idempotent: a converged reconcile does not error", func() {
 		_, err := reconcilerWithFakeAdmin().Reconcile(ctx, reconcile.Request{NamespacedName: key})
 		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("persists Ready=False when a layout reconcile errors", func() {
+		// Regression guard for REVIEW.md #9: an error from a reconcile* step must be written to
+		// status before Reconcile returns, otherwise kubectl keeps showing a stale Ready=True
+		// while the operator error-loops. PlanLayout is the first call reconcileLayout makes, so
+		// failing it drives the LayoutError path without disturbing the shared fake layout.
+		By("provisioning the workload and marking the StatefulSet ready so the reconcile reaches the layout step")
+		_, err := reconcilerWithFakeAdmin().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: defaultSSName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = 1
+		ss.Status.ReadyReplicas = 1
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+
+		failing := &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(string, string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeSelf, recorder: mesh, layout: layout, planErr: fmt.Errorf("admin API unreachable")}, nil
+			},
+		}
+
+		_, err = failing.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).To(HaveOccurred())
+
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		ready := meta.FindStatusCondition(cluster.Status.Conditions, conditionReady)
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+		Expect(ready.Reason).To(Equal("LayoutError"))
 	})
 
 	It("rolls the StatefulSet pod template when the Garage config changes", func() {

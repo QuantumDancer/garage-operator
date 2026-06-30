@@ -231,6 +231,7 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	migrating, err := r.reconcileStorageMigration(ctx, &cluster, status, layoutClient, desired)
 	if err != nil {
 		setCondition(status, conditionReady, metav1.ConditionFalse, "StorageMigrationError", err.Error())
+		_, _ = r.finish(ctx, &cluster, status, ctrl.Result{})
 		return ctrl.Result{}, err
 	}
 	if migrating {
@@ -240,11 +241,13 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	if err := r.reconcileLayout(ctx, &cluster, status, layoutClient, desired); err != nil {
 		setCondition(status, conditionReady, metav1.ConditionFalse, "LayoutError", err.Error())
+		_, _ = r.finish(ctx, &cluster, status, ctrl.Result{})
 		return ctrl.Result{}, err
 	}
 
 	if err := r.reconcileZoneRedundancy(ctx, &cluster, status, layoutClient, desired); err != nil {
 		setCondition(status, conditionReady, metav1.ConditionFalse, "ZoneRedundancyError", err.Error())
+		_, _ = r.finish(ctx, &cluster, status, ctrl.Result{})
 		return ctrl.Result{}, err
 	}
 
