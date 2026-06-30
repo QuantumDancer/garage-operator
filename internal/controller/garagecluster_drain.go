@@ -117,6 +117,21 @@ func distinctZones(desired []nodeEndpoint) int {
 // pass. The cluster keeps serving throughout, so Ready is left to the caller. status.Health
 // must already be set.
 func (r *GarageClusterReconciler) reconcileZoneRedundancy(ctx context.Context, cluster *garagev1alpha1.GarageCluster, status *garagev1alpha1.GarageClusterStatus, layoutClient clusterAdmin, desired []nodeEndpoint) error {
+	// Defer the ungated zone-redundancy change while a destructive layout change is awaiting
+	// approval. Applying a zone change bumps the layout version (SetZoneRedundancy), but the
+	// approval annotation is keyed to the pending change's target version; bumping the version
+	// here would move that target out from under the approval the user is about to give, silently
+	// dropping it until they re-approve (REVIEW.md #11). LayoutChangePending=True means uniquely
+	// "destructive change pending approval" — reconcileLayout's pending branch is the only writer
+	// that sets it True (the approved/additive branches remove it, blockLayoutChange sets it
+	// False), so a permanently blocked change does NOT freeze zone redundancy. Once the drain is
+	// approved+applied or the destructive edit reverted, the condition clears and the next
+	// steady-state requeue applies the zone change.
+	if meta.IsStatusConditionPresentAndEqual(status.Conditions, conditionLayoutChangePending, metav1.ConditionTrue) {
+		logf.FromContext(ctx).Info("Deferring zone-redundancy change while a destructive layout change awaits approval")
+		return nil
+	}
+
 	want := desiredZoneRedundancy(cluster)
 	current, err := layoutClient.CurrentZoneRedundancy(ctx)
 	if err != nil {

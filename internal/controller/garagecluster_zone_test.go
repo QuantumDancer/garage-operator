@@ -265,6 +265,84 @@ func TestReconcileZoneRedundancyBlocksWhenAtLeastOmitted(t *testing.T) {
 	}
 }
 
+// pendingApprovalStatus returns a healthy status carrying a destructive layout change awaiting
+// approval (LayoutChangePending=True/ApprovalRequired), the exact condition reconcileLayout's
+// pending branch sets.
+func pendingApprovalStatus() *garagev1alpha1.GarageClusterStatus {
+	status := healthyZoneStatus()
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:    conditionLayoutChangePending,
+		Status:  metav1.ConditionTrue,
+		Reason:  "ApprovalRequired",
+		Message: "Destructive layout change awaiting approval",
+	})
+	return status
+}
+
+func TestReconcileZoneRedundancyDefersWhilePendingApproval(t *testing.T) {
+	// Regression guard for REVIEW.md #11: applying a zone-redundancy change bumps the layout
+	// version, which would invalidate the approval annotation keyed to a destructive change's
+	// target version and silently drop the user's approval. While that change is pending approval
+	// (LayoutChangePending=True), the zone change must be deferred — not applied — leaving the
+	// version untouched so the annotation the user sets still matches.
+	r, layout := zoneRedundancyReconciler(garageadmin.ZoneRedundancyValue{Maximum: true})
+	cluster := &garagev1alpha1.GarageCluster{
+		Spec: garagev1alpha1.GarageClusterSpec{
+			ZoneRedundancy: &garagev1alpha1.ZoneRedundancy{Mode: garagev1alpha1.ZoneRedundancyAtLeast, AtLeast: 2},
+		},
+	}
+	status := pendingApprovalStatus()
+	versionBefore := layout.version
+
+	if err := reconcileZoneRedundancyWith(t, r, cluster, status, twoZoneDesired()); err != nil {
+		t.Fatalf("reconcileZoneRedundancy: %v", err)
+	}
+	if layout.redundancyCalls != 0 {
+		t.Errorf("SetZoneRedundancy calls = %d, want 0 (deferred while a destructive change is pending approval)", layout.redundancyCalls)
+	}
+	if layout.version != versionBefore {
+		t.Errorf("layout version = %d, want %d unchanged (a bump would invalidate the approval annotation)", layout.version, versionBefore)
+	}
+	if !meta.IsStatusConditionPresentAndEqual(status.Conditions, conditionLayoutChangePending, metav1.ConditionTrue) {
+		t.Error("LayoutChangePending should still be True after deferral")
+	}
+
+	// Once the drain is approved+applied or reverted, reconcileLayout clears the condition; the
+	// next pass must then apply the deferred zone change (the deferral is temporary, not a freeze).
+	meta.RemoveStatusCondition(&status.Conditions, conditionLayoutChangePending)
+	if err := reconcileZoneRedundancyWith(t, r, cluster, status, twoZoneDesired()); err != nil {
+		t.Fatalf("reconcileZoneRedundancy after the pending change cleared: %v", err)
+	}
+	if layout.redundancyCalls != 1 {
+		t.Errorf("SetZoneRedundancy calls = %d, want 1 once the pending change cleared", layout.redundancyCalls)
+	}
+}
+
+func TestReconcileZoneRedundancyNotFrozenByBlockedChange(t *testing.T) {
+	// A permanently blocked destructive change sets LayoutChangePending=False (not True), so it
+	// must NOT freeze zone redundancy — only a genuinely pending-approval change (True) defers it.
+	r, layout := zoneRedundancyReconciler(garageadmin.ZoneRedundancyValue{Maximum: true})
+	cluster := &garagev1alpha1.GarageCluster{
+		Spec: garagev1alpha1.GarageClusterSpec{
+			ZoneRedundancy: &garagev1alpha1.ZoneRedundancy{Mode: garagev1alpha1.ZoneRedundancyAtLeast, AtLeast: 2},
+		},
+	}
+	status := healthyZoneStatus()
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:    conditionLayoutChangePending,
+		Status:  metav1.ConditionFalse,
+		Reason:  reasonBlocked,
+		Message: "Refusing to remove nodes while the cluster is not healthy",
+	})
+
+	if err := reconcileZoneRedundancyWith(t, r, cluster, status, twoZoneDesired()); err != nil {
+		t.Fatalf("reconcileZoneRedundancy: %v", err)
+	}
+	if layout.redundancyCalls != 1 {
+		t.Errorf("SetZoneRedundancy calls = %d, want 1 (a blocked change must not freeze zone redundancy)", layout.redundancyCalls)
+	}
+}
+
 func TestReconcileZoneRedundancyDefersWhenUnhealthy(t *testing.T) {
 	r, layout := zoneRedundancyReconciler(garageadmin.ZoneRedundancyValue{Maximum: true})
 	cluster := &garagev1alpha1.GarageCluster{
