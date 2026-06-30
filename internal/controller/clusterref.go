@@ -33,8 +33,14 @@ import (
 type resolveState int
 
 const (
+	// resolveClusterUnknown is the zero value and is returned on every error path. The
+	// state is meaningless whenever the accompanying error is non-nil, so callers must
+	// check the error first; making the zero value a neutral sentinel ensures a caller
+	// that (incorrectly) switches on the state first never mistakes an apiserver blip for
+	// a deleted cluster and drops a finalizer.
+	resolveClusterUnknown resolveState = iota
 	// resolveReady means the cluster exists, is Ready, and its admin endpoint is returned.
-	resolveReady resolveState = iota
+	resolveReady
 	// resolveClusterMissing means the referenced GarageCluster does not exist.
 	resolveClusterMissing
 	// resolveClusterNotReady means the cluster exists but has not reported Ready yet.
@@ -68,7 +74,7 @@ func resolveClusterConnection(
 		if apierrors.IsNotFound(err) {
 			return clusterConnection{}, resolveClusterMissing, nil
 		}
-		return clusterConnection{}, resolveClusterMissing, err
+		return clusterConnection{}, resolveClusterUnknown, err
 	}
 
 	if !meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionReady) {
@@ -78,11 +84,11 @@ func resolveClusterConnection(
 	tokenRef := resolveAdminTokenSecret(&cluster)
 	var secret corev1.Secret
 	if err := c.Get(ctx, client.ObjectKey{Name: tokenRef.name, Namespace: cluster.Namespace}, &secret); err != nil {
-		return clusterConnection{}, resolveClusterNotReady, err
+		return clusterConnection{}, resolveClusterUnknown, err
 	}
 	token, ok := secret.Data[tokenRef.key]
 	if !ok {
-		return clusterConnection{}, resolveClusterNotReady,
+		return clusterConnection{}, resolveClusterUnknown,
 			fmt.Errorf("admin token Secret %q is missing key %q", tokenRef.name, tokenRef.key)
 	}
 
