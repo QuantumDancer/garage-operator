@@ -431,13 +431,31 @@ type nodeEndpoint struct {
 	nodeID   string
 	zone     string
 	capacity resource.Quantity
+
+	// reachable reports whether the node's Garage admin API answered this pass. An
+	// unreachable node is still kept in the desired set (so layout planning does not mistake a
+	// transient outage for a removal and drain it), but it must not be used as the layout
+	// client and must not be peered to. Only consumers that act on reachability read this; the
+	// distinctZones/migration helpers ignore it.
+	reachable bool
 }
 
 // discoverNodes resolves each pod's Garage node id over headless per-pod DNS and returns the
 // desired layout plus a client to use for layout operations (the layout is cluster-wide, so
-// any reachable node serves). An error means a node is not reachable yet — the caller treats
-// that as "requeue", not a failure.
+// any reachable node serves). An error means the layout cannot be planned this pass (no zone
+// resolvable, no client constructible, or no node reachable at all) — the caller treats that
+// as "requeue", not a failure.
+//
+// A single unreachable node must NOT freeze every other day-2 operation: the cluster keeps
+// serving on quorum, so the operator proceeds on the reachable subset. The catch is that the
+// returned set feeds both peering and layout planning, and dropping an unreachable node from
+// the layout set would make PlanLayout read it as a removal and drain a node that is merely
+// temporarily down. So an unreachable node that is already in the applied layout is retained
+// here from its last-known status (with reachable=false) precisely so it is never treated as
+// a removal; a brand-new node that was never laid out is skipped instead, since excluding a
+// pending addition is safe.
 func (r *GarageClusterReconciler) discoverNodes(ctx context.Context, cluster *garagev1alpha1.GarageCluster, token string) ([]nodeEndpoint, clusterAdmin, error) {
+	log := logf.FromContext(ctx)
 	var nodes []nodeEndpoint
 	var layoutClient clusterAdmin
 
@@ -456,23 +474,54 @@ func (r *GarageClusterReconciler) discoverNodes(ctx context.Context, cluster *ga
 			}
 			nodeID, err := admin.NodeID(ctx)
 			if err != nil {
-				return nil, nil, fmt.Errorf("node %s: %w", podName, err)
+				// The node's admin API is unreachable. resolveZone above reads Kubernetes objects,
+				// not Garage, so the live zone is still trustworthy for a down node.
+				if cached, ok := layoutNodeForPod(cluster, podName); ok {
+					log.Info("Garage node is unreachable; proceeding with its last-known layout entry", "node", podName, "nodeID", cached.NodeID)
+					nodes = append(nodes, nodeEndpoint{
+						pod:       podName,
+						nodeID:    cached.NodeID,
+						zone:      zone,
+						capacity:  pool.Storage.Data.Size,
+						reachable: false,
+					})
+					continue
+				}
+				// Never laid out, so it is a pending addition rather than a removal — excluding it
+				// is safe, and it has no node id to contribute anyway.
+				log.Info("New Garage node is not reachable yet; skipping until it answers", "node", podName)
+				continue
 			}
 			if layoutClient == nil {
 				layoutClient = admin
 			}
 			nodes = append(nodes, nodeEndpoint{
-				pod:      podName,
-				nodeID:   nodeID,
-				zone:     zone,
-				capacity: pool.Storage.Data.Size,
+				pod:       podName,
+				nodeID:    nodeID,
+				zone:      zone,
+				capacity:  pool.Storage.Data.Size,
+				reachable: true,
 			})
 		}
 	}
 	if layoutClient == nil {
-		return nil, nil, fmt.Errorf("no nodes discovered")
+		return nil, nil, fmt.Errorf("no reachable nodes discovered")
 	}
 	return nodes, layoutClient, nil
+}
+
+// layoutNodeForPod returns the applied-layout entry for a pod from the last reconcile's
+// status, used to retain an unreachable-but-already-laid-out node in the desired set.
+func layoutNodeForPod(cluster *garagev1alpha1.GarageCluster, podName string) (garagev1alpha1.LayoutNodeStatus, bool) {
+	if cluster.Status.Layout == nil {
+		return garagev1alpha1.LayoutNodeStatus{}, false
+	}
+	for _, n := range cluster.Status.Layout.Nodes {
+		if n.Pod == podName {
+			return n, true
+		}
+	}
+	return garagev1alpha1.LayoutNodeStatus{}, false
 }
 
 // resolveZone determines the Garage layout zone for a single pod. Precedence (PLAN §4.1):
@@ -533,17 +582,29 @@ func (r *GarageClusterReconciler) finish(ctx context.Context, cluster *garagev1a
 }
 
 // peerConnectStrings builds the Garage connect strings ("<nodeID>@<host>:<rpcPort>") the
-// operator hands to ConnectNodes. The first node backs the layout client and is the one we
-// connect *from*, so it is excluded — connecting it to every other node is enough for gossip
-// to propagate full membership. Returns nil for a single-node cluster (nothing to peer).
+// operator hands to ConnectNodes. The first reachable node backs the layout client and is the
+// one we connect *from*, so it is excluded — connecting it to every other node is enough for
+// gossip to propagate full membership. This shares discoverNodes' invariant that the layout
+// client is the first reachable node, so both functions agree on which node to connect from.
+// Unreachable nodes are skipped entirely: they are retained in the desired set only to keep
+// layout planning from draining them, never to be dialed. Returns nil when there is no second
+// reachable node to peer to.
 func peerConnectStrings(cluster *garagev1alpha1.GarageCluster, nodes []nodeEndpoint) []string {
-	if len(nodes) < 2 {
-		return nil
-	}
-	peers := make([]string, 0, len(nodes)-1)
-	for _, n := range nodes[1:] {
+	peers := make([]string, 0, len(nodes))
+	connectFromSeen := false
+	for _, n := range nodes {
+		if !n.reachable {
+			continue
+		}
+		if !connectFromSeen {
+			connectFromSeen = true
+			continue
+		}
 		host := fmt.Sprintf("%s.%s.%s.svc", n.pod, headlessServiceName(cluster), cluster.Namespace)
 		peers = append(peers, fmt.Sprintf("%s@%s:%d", n.nodeID, host, portRPC))
+	}
+	if len(peers) == 0 {
+		return nil
 	}
 	return peers
 }

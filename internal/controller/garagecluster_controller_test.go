@@ -139,6 +139,11 @@ type fakeClusterAdmin struct {
 	// healthErr, when set, makes Health fail so a test can drive the swallowed-health-error
 	// path: the cached status.Health must be invalidated rather than left stale.
 	healthErr error
+
+	// unreachable, keyed by node id, makes NodeID fail for the matching pod so a test can
+	// simulate a single down node while the rest of the cluster keeps answering. A shared map
+	// across the per-pod clients one reconcile creates lets a test mark exactly one node down.
+	unreachable map[string]bool
 }
 
 func (f *fakeClusterAdmin) CreateMetadataSnapshot(context.Context, string) (garageadmin.MultiNodeResult, error) {
@@ -173,7 +178,12 @@ func (f *fakeClusterAdmin) ListActiveWorkers(context.Context, string) ([]garagea
 	return nil, nil
 }
 
-func (f *fakeClusterAdmin) NodeID(context.Context) (string, error) { return f.nodeID, nil }
+func (f *fakeClusterAdmin) NodeID(context.Context) (string, error) {
+	if f.unreachable[f.nodeID] {
+		return "", fmt.Errorf("admin API unreachable")
+	}
+	return f.nodeID, nil
+}
 
 func (f *fakeClusterAdmin) ConnectNodes(_ context.Context, peers []string) error {
 	if f.recorder != nil {
@@ -741,6 +751,117 @@ var _ = Describe("GarageCluster destructive layout (scale-down)", Ordered, func(
 		Expect(meta.IsStatusConditionTrue(cluster.Status.Conditions, conditionLayoutApplied)).To(BeTrue())
 		Expect(cluster.Status.Layout.Version).To(Equal(int64(2)))
 		Expect(cluster.Status.Layout.Nodes).To(HaveLen(2))
+	})
+})
+
+var _ = Describe("GarageCluster day-2 ops with one unreachable node", Ordered, func() {
+	// Regression guard for REVIEW.md #3: a single unreachable node must not freeze every other
+	// day-2 operation. discoverNodes used to bail on the first node whose admin API was down, so
+	// Reconcile returned before the layout step and a *different* node the user had removed from
+	// spec never got drained. The fix proceeds on the reachable subset while keeping the
+	// unreachable-but-still-desired node in the layout set so it is never mistaken for a removal
+	// and drained (which would lose redundancy on a node that is merely temporarily down).
+	const (
+		resourceName      = "unreach"
+		resourceNamespace = "default"
+		ssName            = "unreach-default"
+	)
+
+	ctx := context.Background()
+	key := types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}
+
+	layout := newFakeLayout()
+	mesh := &meshRecorder{}
+	// down is shared across the per-pod clients each reconcile creates, so flipping one entry
+	// takes exactly that node's admin API offline mid-suite.
+	down := map[string]bool{}
+	reconciler := func() *GarageClusterReconciler {
+		return &GarageClusterReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+			NewAdminClient: func(baseURL, _ string) (clusterAdmin, error) {
+				return &fakeClusterAdmin{nodeID: nodeIDFromBaseURL(baseURL), recorder: mesh, layout: layout, unreachable: down}, nil
+			},
+		}
+	}
+
+	markReady := func(replicas int32) {
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		ss.Status.ObservedGeneration = ss.Generation
+		ss.Status.Replicas = replicas
+		ss.Status.ReadyReplicas = replicas
+		Expect(k8sClient.Status().Update(ctx, &ss)).To(Succeed())
+	}
+
+	BeforeAll(func() {
+		resource := &garagev1alpha1.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace},
+			Spec:       newBasicClusterSpec(3, 3),
+		}
+		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+		By("converging the 3-node cluster to Ready while every node is reachable")
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		markReady(3)
+		_, err = reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(layout.applyCalls).To(Equal(1))
+		Expect(layout.applied).To(HaveLen(3))
+
+		By("standing up the PVCs the StatefulSet controller would have created")
+		for ord := range 3 {
+			for _, vol := range []string{volumeNameMeta, volumeNameData} {
+				createPVC(ctx, resourceNamespace, fmt.Sprintf("%s-%s-%d", vol, ssName, ord))
+			}
+		}
+	})
+
+	AfterAll(func() {
+		resource := &garagev1alpha1.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, resource)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+	})
+
+	It("drains a removed node while a different node is down, without draining the down node", func() {
+		By("taking node-1's admin API offline")
+		down[nodeIDFromBaseURL("http://unreach-default-1.")] = true
+
+		By("removing node-2 from spec and pre-approving its drain (target version 2)")
+		var cluster garagev1alpha1.GarageCluster
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		cluster.Spec.NodePools[0].Replicas = 2
+		cluster.Annotations = map[string]string{annotationApproveLayout: "2"}
+		Expect(k8sClient.Update(ctx, &cluster)).To(Succeed())
+
+		_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		By("proceeding to the drain on the reachable subset instead of bailing on the down node")
+		Expect(layout.applyCalls).To(Equal(2))
+		var ss appsv1.StatefulSet
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ssName, Namespace: resourceNamespace}, &ss)).To(Succeed())
+		Expect(*ss.Spec.Replicas).To(Equal(int32(2)))
+
+		By("draining only the removed node's PVCs, keeping the down node's and the survivor's")
+		for _, vol := range []string{volumeNameMeta, volumeNameData} {
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-2", vol, ssName))).To(BeFalse())
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-1", vol, ssName))).To(BeTrue())
+			Expect(pvcExists(ctx, resourceNamespace, fmt.Sprintf("%s-%s-0", vol, ssName))).To(BeTrue())
+		}
+
+		By("keeping the unreachable node in the applied layout so it is never treated as a removal")
+		Expect(k8sClient.Get(ctx, key, &cluster)).To(Succeed())
+		Expect(cluster.Status.Layout.Version).To(Equal(int64(2)))
+		Expect(cluster.Status.Layout.Nodes).To(HaveLen(2))
+		laidOut := map[string]struct{}{}
+		for _, n := range cluster.Status.Layout.Nodes {
+			laidOut[n.NodeID] = struct{}{}
+		}
+		Expect(laidOut).To(HaveKey("id-unreach-default-1"), "the down node must remain in the layout")
+		Expect(laidOut).To(HaveKey("id-unreach-default-0"))
+		Expect(laidOut).NotTo(HaveKey("id-unreach-default-2"), "only the spec-removed node should be drained")
 	})
 })
 
